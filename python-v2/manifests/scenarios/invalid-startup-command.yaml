@@ -1,0 +1,33 @@
+# Scenario 10: Invalid Startup Command
+# Intended Failure:
+#   The container specifies an entrypoint executable that does not exist in the image
+#   ('/bin/nonexistent-binary-command'). Unlike an application logic error (exit code 1),
+#   the container runtime fails to execute the process, resulting in an OCI/exec lookup error.
+# Expected Kubernetes Evidence:
+#   - Container state: Waiting (reason="CrashLoopBackOff" or "RunContainerError").
+#   - Container lastState: Terminated (exit code 127, reason="ContainerCannotRun" or "Error").
+#   - Terminated/Event message: includes "executable file not found in $PATH" or "no such file or directory".
+#   - Kubelet Warning Event: Reason="Failed", Message includes "failed to start container".
+#   - Application logs: Empty or unavailable (process never successfully started).
+
+apiVersion: v1
+kind: Pod
+metadata:
+  name: invalid-startup-command
+  namespace: k8s-agent-demo
+  labels:
+    app: invalid-startup-command
+spec:
+  containers:
+    - name: app
+      image: busybox:1.36
+      command:
+        - /bin/nonexistent-binary-command
+        - --start
+      resources:
+        requests:
+          cpu: "10m"
+          memory: "16Mi"
+        limits:
+          cpu: "50m"
+          memory: "32Mi"

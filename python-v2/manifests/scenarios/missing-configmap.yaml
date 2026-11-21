@@ -1,0 +1,35 @@
+# Scenario 7: Missing ConfigMap Reference
+# Intended Failure:
+#   The Pod requests an environment variable from a ConfigMap ('nonexistent-configmap')
+#   that does not exist in the namespace. The container fails before it can start.
+# Expected Kubernetes Evidence:
+#   - Container state: Waiting (reason="CreateContainerConfigError").
+#   - Waiting message: "configmap \"nonexistent-configmap\" not found".
+#   - Pod phase: Pending.
+#   - Kubelet Warning Event: Reason="Failed", Message="Error: configmap \"nonexistent-configmap\" not found".
+
+apiVersion: v1
+kind: Pod
+metadata:
+  name: missing-configmap
+  namespace: k8s-agent-demo
+  labels:
+    app: missing-configmap
+spec:
+  containers:
+    - name: app
+      image: busybox:1.36
+      command: ["sh", "-c", "echo Config: $APP_CONFIG; sleep 3600"]
+      env:
+        - name: APP_CONFIG
+          valueFrom:
+            configMapKeyRef:
+              name: nonexistent-configmap
+              key: config.json
+      resources:
+        requests:
+          cpu: "10m"
+          memory: "16Mi"
+        limits:
+          cpu: "50m"
+          memory: "32Mi"

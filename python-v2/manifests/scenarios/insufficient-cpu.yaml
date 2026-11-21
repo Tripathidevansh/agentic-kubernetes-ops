@@ -1,0 +1,16 @@
+
+apiVersion: v1
+kind: Pod
+metadata:
+  name: insufficient-cpu
+  namespace: k8s-agent-demo
+  labels:
+    app: insufficient-cpu
+spec:
+  containers:
+    - name: app
+      image: nginx:1.27
+      resources:
+        requests:
+          cpu: "100"
+          memory: "32Mi"

@@ -1,0 +1,26 @@
+# ==============================================================================
+# Root Git Ignore
+# ==============================================================================
+
+# Environment variables & secrets (CRITICAL: Never commit .env files)
+.env
+.env.*
+*.env
+
+# Python Virtual Environments & Cache
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Operating System Files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+
+# IDEs
+.idea/
+.vscode/

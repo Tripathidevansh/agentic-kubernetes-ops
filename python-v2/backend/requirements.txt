@@ -1,0 +1,13 @@
+# Python v2 Backend Dependencies
+# Python 3.12 compatible
+kubernetes>=37.0.3
+pydantic>=2.14.3
+pydantic-settings>=2.16.3
+PyYAML>=6.0.3
+fastapi>=0.164.0
+uvicorn>=0.54.0
+mcp>=2.3.0
+google-adk[mcp]==2.15.0
+pytest>=9.2.0
+anyio>=4.16.0
+httpx>=0.28.1
