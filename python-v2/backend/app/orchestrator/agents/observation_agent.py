@@ -25,10 +25,12 @@ from google.genai.types import HttpRetryOptions
 from app.mcp_client import K8sMcpClientBridge
 from app.models.investigation import (
     AgentToolCallTrace,
+    GeminiRequestMetric,
     InvestigationRequest,
     ObservationReport,
 )
 from app.orchestrator.prompts import OBSERVATION_AGENT_INSTRUCTION
+from app.orchestrator.sanitizer import sanitize_error_message
 from app.validators.safety_validator import (
     validate_read_only_tools,
     validate_secret_safety,
@@ -62,6 +64,11 @@ class ObservationAgent:
         self.model_name = model_name or os.environ.get("GEMINI_MODEL", DEFAULT_GEMINI_MODEL)
         self.retry_options = retry_options or DEFAULT_RETRY_OPTIONS
         self._agent: Optional[LlmAgent] = None
+        self.metrics: List[GeminiRequestMetric] = []
+
+    def get_metrics(self) -> List[GeminiRequestMetric]:
+        """Return instrumentation metrics captured for Gemini requests in this agent."""
+        return list(self.metrics)
 
     async def get_adk_agent(self) -> LlmAgent:
         """
@@ -109,6 +116,7 @@ class ObservationAgent:
         llm_synthesis: Optional[str] = None
         gemini_succeeded: bool = False
         llm_error_details: Optional[Dict[str, Any]] = None
+        self.metrics = []
 
         api_key = os.environ.get("GEMINI_API_KEY")
         if use_llm and not api_key:
@@ -120,6 +128,8 @@ class ObservationAgent:
         if use_llm:
             logger.info("Executing Observation Agent with Gemini model '%s'", self.model_name)
             llm_timeout = max(10.0, timeout_seconds - 20.0)
+            t_llm_start = time.time()
+            started_at = datetime.now(timezone.utc).isoformat()
             try:
                 agent = await self.get_adk_agent()
                 session_service = InMemorySessionService()
@@ -176,27 +186,79 @@ class ObservationAgent:
 
                 await asyncio.wait_for(_run_agent_loop(), timeout=llm_timeout)
                 gemini_succeeded = True
+                llm_duration_ms = (time.time() - t_llm_start) * 1000.0
+                self.metrics.append(
+                    GeminiRequestMetric(
+                        stage="OBSERVATION",
+                        model=self.model_name,
+                        started_at=started_at,
+                        completed_at=datetime.now(timezone.utc).isoformat(),
+                        duration_ms=llm_duration_ms,
+                        success=True,
+                        fallback_triggered=False,
+                    )
+                )
             except asyncio.TimeoutError:
+                llm_duration_ms = (time.time() - t_llm_start) * 1000.0
                 logger.warning(
                     "Observation Agent LLM timed out after %.1f seconds; falling back to deterministic telemetry collection.",
                     llm_timeout,
                 )
+                timeout_msg = f"Observation Agent Gemini invocation timed out after {llm_timeout:.1f}s"
                 llm_error_details = {
                     "type": "TimeoutError",
-                    "message": f"Observation Agent Gemini invocation timed out after {llm_timeout:.1f}s",
+                    "message": timeout_msg,
                 }
                 gemini_succeeded = False
+                self.metrics.append(
+                    GeminiRequestMetric(
+                        stage="OBSERVATION",
+                        model=self.model_name,
+                        started_at=started_at,
+                        completed_at=datetime.now(timezone.utc).isoformat(),
+                        duration_ms=llm_duration_ms,
+                        success=False,
+                        error_type="TimeoutError",
+                        error_message=timeout_msg,
+                        fallback_triggered=True,
+                        fallback_reason=timeout_msg,
+                    )
+                )
             except Exception as exc:
+                llm_duration_ms = (time.time() - t_llm_start) * 1000.0
                 logger.warning(
                     "Observation Agent LLM execution encountered an error (%s: %s); falling back to deterministic telemetry collection.",
                     type(exc).__name__,
                     exc,
                 )
+                sanitized_msg = sanitize_error_message(str(exc))
                 llm_error_details = {
                     "type": type(exc).__name__,
-                    "message": str(exc),
+                    "message": sanitized_msg,
                 }
                 gemini_succeeded = False
+                status_code = getattr(exc, "code", None) or getattr(exc, "status_code", None)
+                if not isinstance(status_code, int):
+                    status_code = None
+                retries = getattr(exc, "attempts", None) or getattr(exc, "retry_count", None)
+                if not isinstance(retries, int):
+                    retries = None
+                self.metrics.append(
+                    GeminiRequestMetric(
+                        stage="OBSERVATION",
+                        model=self.model_name,
+                        started_at=started_at,
+                        completed_at=datetime.now(timezone.utc).isoformat(),
+                        duration_ms=llm_duration_ms,
+                        success=False,
+                        status_code=status_code,
+                        error_type=type(exc).__name__,
+                        error_message=sanitized_msg,
+                        retries_attempted=retries,
+                        fallback_triggered=True,
+                        fallback_reason=f"Observation Agent LLM encountered {type(exc).__name__}: {sanitized_msg}",
+                    )
+                )
 
         # Telemetry ingestion: query scan_cluster to ensure complete structured data
         t0 = time.time()
@@ -216,17 +278,20 @@ class ObservationAgent:
         duration_ms = (time.time() - t0) * 1000.0
 
         scan_success = scan_res.get("success", False)
-        traces.append(
-            AgentToolCallTrace(
-                agent_name="telemetry_collector",
-                tool_name="scan_cluster",
-                arguments={"namespace": request.namespace},
-                status="SUCCESS" if scan_success else "ERROR",
-                duration_ms=duration_ms,
-                result_summary=f"Pods scanned: {len(scan_res.get('data', {}).get('pods', [])) if scan_res.get('data') else 0}",
-                error_message=str(scan_res.get("error")) if not scan_success else None,
+        # Avoid recording duplicate scan_cluster trace if the LLM already invoked it successfully
+        has_scan_trace = any(t.tool_name == "scan_cluster" and t.status == "SUCCESS" for t in traces)
+        if not has_scan_trace:
+            traces.append(
+                AgentToolCallTrace(
+                    agent_name="telemetry_collector",
+                    tool_name="scan_cluster",
+                    arguments={"namespace": request.namespace},
+                    status="SUCCESS" if scan_success else "ERROR",
+                    duration_ms=duration_ms,
+                    result_summary=f"Pods scanned: {len(scan_res.get('data', {}).get('pods', [])) if scan_res.get('data') else 0}",
+                    error_message=str(scan_res.get("error")) if not scan_success else None,
+                )
             )
-        )
 
         if not scan_success:
             err_msg = scan_res.get("error") or "Unknown error in scan_cluster"

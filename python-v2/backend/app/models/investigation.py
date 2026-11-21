@@ -37,6 +37,22 @@ class AgentToolCallTrace(BaseModel):
     error_message: Optional[Any] = Field(default=None, description="Error message if the call failed")
 
 
+class GeminiRequestMetric(BaseModel):
+    """Instrumentation metrics for a single logical Gemini request."""
+    stage: str = Field(..., description="Pipeline stage: OBSERVATION or REMEDIATION")
+    model: str = Field(..., description="Configured Gemini model name")
+    started_at: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
+    completed_at: Optional[str] = Field(default=None, description="Timestamp of request completion or failure")
+    duration_ms: Optional[float] = Field(default=None, description="Execution duration in milliseconds")
+    success: bool = Field(default=False, description="Whether the request succeeded")
+    status_code: Optional[int] = Field(default=None, description="HTTP response status code if available from SDK/exception, else None")
+    error_type: Optional[str] = Field(default=None, description="Exception class name if failed")
+    error_message: Optional[str] = Field(default=None, description="Sanitized error description")
+    retries_attempted: Optional[int] = Field(default=None, description="Number of retries attempted if exposed by SDK, else None")
+    fallback_triggered: bool = Field(default=False, description="Whether deterministic fallback was triggered")
+    fallback_reason: Optional[str] = Field(default=None, description="Reason why fallback was triggered")
+
+
 class ObservationReport(BaseModel):
     """Structured cluster telemetry collected during the Observation phase."""
     namespace: str = Field(..., description="Kubernetes namespace observed")
@@ -94,6 +110,30 @@ class InvestigationResult(BaseModel):
     provenance: str = Field(
         default="DETERMINISTIC_FALLBACK",
         description="Investigation execution mode: GEMINI_AGENT or DETERMINISTIC_FALLBACK"
+    )
+    outcome: Optional[str] = Field(
+        default=None,
+        description="Overall investigation outcome: COMPLETED_WITH_GEMINI, COMPLETED_WITH_FALLBACK, or FAILED",
+    )
+    observation_provenance: str = Field(
+        default="DETERMINISTIC_FALLBACK",
+        description="Observation stage execution mode: GEMINI_AGENT or DETERMINISTIC_FALLBACK",
+    )
+    diagnosis_provenance: str = Field(
+        default="DETERMINISTIC_ENGINE",
+        description="Diagnosis stage execution mode: DETERMINISTIC_ENGINE",
+    )
+    remediation_provenance: str = Field(
+        default="DETERMINISTIC_FALLBACK",
+        description="Remediation stage execution mode: GEMINI_AGENT or DETERMINISTIC_FALLBACK",
+    )
+    verification_provenance: str = Field(
+        default="DETERMINISTIC_ENGINE",
+        description="Verification stage execution mode: DETERMINISTIC_ENGINE",
+    )
+    gemini_metrics: List[GeminiRequestMetric] = Field(
+        default_factory=list,
+        description="Instrumentation metrics for all logical Gemini requests",
     )
     model_metadata: Optional[Dict[str, Any]] = Field(
         default=None,

@@ -93,7 +93,9 @@ async def run_live_agent_check() -> int:
         print(f"      Investigation ID    : {result.investigation_id}")
         print(f"      Target Namespace    : {result.namespace}")
         print(f"      Completed At        : {result.completed_at}")
-        print(f"      Pipeline Provenance : {result.provenance}")
+        print(f"      Overall Outcome     : {result.outcome}")
+        print(f"      Stage Provenances   : Observation={result.observation_provenance} | Diagnosis={result.diagnosis_provenance}")
+        print(f"                            Remediation={result.remediation_provenance} | Verification={result.verification_provenance}")
         if result.model_metadata:
             print(f"      Model / Provider    : {result.model_metadata.get('model')} / {result.model_metadata.get('provider')}")
             if result.model_metadata.get("gemini_error"):
@@ -104,10 +106,28 @@ async def run_live_agent_check() -> int:
             print(f" [FAIL] Failed Stage        : {result.error.get('failed_at_status')}")
             print(f"        Error Type          : {result.error.get('type')}")
             print(f"        Error Message       : {result.error.get('message')}")
+            print_banner("PHASE 4C LIVE INVESTIGATION FAILED")
             return 1
 
+        # Gemini API Request Metrics
+        print_section("Step 3: Gemini API Request & Latency Instrumentation")
+        if result.gemini_metrics:
+            print(f" Total Gemini Requests Tracked: {len(result.gemini_metrics)}")
+            for idx, m in enumerate(result.gemini_metrics, 1):
+                dur_str = f"{m.duration_ms:.1f}ms" if m.duration_ms is not None else "N/A"
+                code_str = str(m.status_code) if m.status_code is not None else "null"
+                retries_str = str(m.retries_attempted) if m.retries_attempted is not None else "null"
+                print(f"   {idx}. Stage: {m.stage:<12} Model: {m.model} Duration: {dur_str}")
+                print(f"      Success: {m.success} | HTTP Status: {code_str} | Retries: {retries_str}")
+                if m.fallback_triggered:
+                    print(f"      Fallback Triggered : {m.fallback_triggered} (Reason: {m.fallback_reason})")
+                if m.error_type:
+                    print(f"      Error Details      : [{m.error_type}] {m.error_message}")
+        else:
+            print(" No Gemini API requests executed (Deterministic run).")
+
         # Summary of Observation stage
-        print_section("Step 3: Observation Stage Summary")
+        print_section("Step 4: Observation Stage Summary")
         if result.observation:
             print(f" Observation Provenance : {result.observation.provenance}")
             if result.observation.llm_error:
@@ -119,7 +139,7 @@ async def run_live_agent_check() -> int:
                 print(f"   ... and {len(result.observation.pods) - 5} more Pods")
 
         # Summary of Deterministic Diagnoses
-        print_section("Step 4: Authoritative Deterministic Diagnoses")
+        print_section("Step 5: Authoritative Deterministic Diagnoses")
         print(f" Total Diagnoses: {len(result.diagnoses)}")
         for idx, d in enumerate(result.diagnoses, 1):
             sev = d.get("severity", "INFO")
@@ -128,8 +148,12 @@ async def run_live_agent_check() -> int:
             print(f"   {idx:2d}. [{sev:<8}] {res:<36} -> {ftype}")
 
         # Summary of Remediation Proposals
-        print_section("Step 5: Grounded Remediation Proposals & Human Approval Guardrails")
-        print(f" Total Proposals: {len(result.remediation_proposals)}")
+        print_section("Step 6: Grounded Remediation Proposals & Human Approval Guardrails")
+        total_props = len(result.remediation_proposals)
+        actionable_count = sum(1 for p in result.remediation_proposals if p.get("can_remediate"))
+        insufficient_count = sum(1 for p in result.remediation_proposals if p.get("status") == "INSUFFICIENT_EVIDENCE")
+        rejected_count = sum(1 for p in result.remediation_proposals if p.get("status") == "REJECTED_SAFETY_VIOLATION")
+        print(f" Total Proposals: {total_props} (Actionable: {actionable_count}, Insufficient Evidence: {insufficient_count}, Safety Rejected: {rejected_count})")
         for idx, prop in enumerate(result.remediation_proposals, 1):
             workload = prop.get("target_workload")
             t_kind = prop.get("target_kind")
@@ -156,15 +180,23 @@ async def run_live_agent_check() -> int:
             print(f"       Justification      : {prop.get('justification')[:80]}...")
 
         # Summary of Tool Traces
-        print_section("Step 6: Execution Tool Call Traces")
+        print_section("Step 7: Complete MCP & Agent Tool Call Traces")
         print(f" Total Traces Recorded: {len(result.tool_traces)}")
         for idx, tr in enumerate(result.tool_traces, 1):
             agent = tr.agent_name
             tname = tr.tool_name
             dur = f"{tr.duration_ms:.1f}ms" if tr.duration_ms else "N/A"
-            print(f"   {idx:2d}. [{dur:>8}] {agent:<30} -> {tname}")
+            status = tr.status
+            summary = f" - {tr.result_summary}" if tr.result_summary else ""
+            print(f"   {idx:2d}. [{dur:>8}] [{status:<7}] {agent:<22} -> {tname}{summary}")
 
-        print_banner("PHASE 4C LIVE GEMINI INVESTIGATION PASSED SUCCESSFULLY")
+        if result.outcome == "COMPLETED_WITH_GEMINI":
+            print_banner("PHASE 4C LIVE GEMINI INVESTIGATION PASSED (COMPLETED_WITH_GEMINI)")
+        elif result.outcome == "COMPLETED_WITH_FALLBACK":
+            print_banner("PHASE 4C LIVE INVESTIGATION COMPLETED WITH DETERMINISTIC FALLBACK")
+        else:
+            print_banner(f"PHASE 4C LIVE INVESTIGATION FINISHED ({result.outcome})")
+        return 0
         return 0
 
     except Exception as exc:

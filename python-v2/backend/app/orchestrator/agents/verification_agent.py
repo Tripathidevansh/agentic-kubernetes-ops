@@ -7,8 +7,10 @@ Only attaches verification plans to actionable proposals that contain a patch.
 """
 
 import logging
+import time
 from typing import Any, Dict, List, Optional
 
+from app.models.investigation import AgentToolCallTrace
 from app.models.remediation import RemediationProposal, VerificationPlan
 
 logger = logging.getLogger(__name__)
@@ -37,6 +39,11 @@ class VerificationPlanner:
     def __init__(self, check_interval_seconds: int = 5, timeout_seconds: int = 60):
         self.check_interval_seconds = check_interval_seconds
         self.timeout_seconds = timeout_seconds
+        self.traces: List[AgentToolCallTrace] = []
+
+    def get_traces(self) -> List[AgentToolCallTrace]:
+        """Return traces recorded during verification planning."""
+        return list(self.traces)
 
     def plan_verification(
         self,
@@ -54,6 +61,8 @@ class VerificationPlanner:
         Returns:
             Updated list of proposals with attached VerificationPlan objects where actionable.
         """
+        t0 = time.time()
+        self.traces = []
         diag_map = {}
         if diagnoses:
             for d in diagnoses:
@@ -93,5 +102,21 @@ class VerificationPlanner:
                 proposal.target_workload,
                 failure_type,
             )
+
+        t_ms = (time.time() - t0) * 1000.0
+        actionable_count = sum(1 for p in proposals if p.verification_plan is not None)
+        self.traces.append(
+            AgentToolCallTrace(
+                agent_name="verification_planner",
+                tool_name="plan_verification",
+                arguments={
+                    "proposals_count": len(proposals),
+                    "diagnoses_count": len(diagnoses) if diagnoses else 0,
+                },
+                status="SUCCESS",
+                duration_ms=t_ms,
+                result_summary=f"Attached verification plans to {actionable_count} actionable proposals",
+            )
+        )
 
         return proposals

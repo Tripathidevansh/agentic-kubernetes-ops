@@ -16,6 +16,7 @@ import uuid
 from app.mcp_client import K8sMcpClientBridge
 from app.models.investigation import (
     AgentToolCallTrace,
+    GeminiRequestMetric,
     InvestigationRequest,
     InvestigationResult,
     InvestigationStatus,
@@ -26,6 +27,7 @@ from app.orchestrator.agents.diagnosis_agent import DeterministicDiagnosisAgent
 from app.orchestrator.agents.observation_agent import ObservationAgent
 from app.orchestrator.agents.remediation_agent import RemediationPlanner
 from app.orchestrator.agents.verification_agent import VerificationPlanner
+from app.orchestrator.sanitizer import sanitize_error_message
 from app.validators.safety_validator import validate_read_only_tools
 
 logger = logging.getLogger(__name__)
@@ -88,6 +90,9 @@ class InvestigationPipeline:
         )
 
         all_traces: List[AgentToolCallTrace] = []
+        gemini_metrics: List[GeminiRequestMetric] = []
+        obs_agent: Optional[ObservationAgent] = None
+        rem_planner: Optional[RemediationPlanner] = None
         should_close_bridge = not self._external_bridge
 
         try:
@@ -101,6 +106,7 @@ class InvestigationPipeline:
             validate_read_only_tools(tools)
 
             async def _run_pipeline_stages() -> InvestigationResult:
+                nonlocal obs_agent, rem_planner
                 # -------------------------------------------------------------
                 # Stage 1: Observation
                 # -------------------------------------------------------------
@@ -150,6 +156,7 @@ class InvestigationPipeline:
                     ),
                     timeout=self.stage_timeout,
                 )
+                all_traces.extend(rem_planner.get_traces())
 
                 # -------------------------------------------------------------
                 # Stage 4: Verification Planning
@@ -160,9 +167,25 @@ class InvestigationPipeline:
                     proposals=proposals,
                     diagnoses=diagnoses,
                 )
+                all_traces.extend(ver_planner.get_traces())
                 result.remediation_proposals = [p.model_dump() for p in verified_proposals]
 
-                # Provenance and metadata
+                # Independent stage provenances
+                obs_provenance = obs_report.provenance if obs_report else "DETERMINISTIC_FALLBACK"
+                result.observation_provenance = obs_provenance
+                result.diagnosis_provenance = "DETERMINISTIC_ENGINE"
+                result.remediation_provenance = rem_planner.remediation_provenance
+                result.verification_provenance = "DETERMINISTIC_ENGINE"
+
+                # Collect Gemini metrics across stages
+                stage_metrics: List[GeminiRequestMetric] = []
+                if obs_agent:
+                    stage_metrics.extend(obs_agent.get_metrics())
+                if rem_planner:
+                    stage_metrics.extend(rem_planner.get_metrics())
+                result.gemini_metrics = stage_metrics
+
+                # Provenance and metadata (backward compatibility)
                 gemini_used = (
                     use_llm
                     and bool(os.environ.get("GEMINI_API_KEY"))
@@ -182,11 +205,24 @@ class InvestigationPipeline:
                         metadata["gemini_error"] = obs_report.llm_error
                     result.model_metadata = metadata
 
+                # Determine overall outcome
+                gemini_obs_ok = (result.observation_provenance == "GEMINI_AGENT")
+                gemini_rem_ok = (result.remediation_provenance == "GEMINI_AGENT")
+                if not diagnoses:
+                    both_succeeded = gemini_obs_ok
+                else:
+                    both_succeeded = gemini_obs_ok and gemini_rem_ok
+
+                if both_succeeded:
+                    result.outcome = "COMPLETED_WITH_GEMINI"
+                else:
+                    result.outcome = "COMPLETED_WITH_FALLBACK"
+
                 # Complete pipeline
                 result.status = InvestigationStatus.COMPLETED
                 result.completed_at = datetime.now(timezone.utc).isoformat()
                 result.tool_traces = all_traces
-                logger.info("[%s] Pipeline completed successfully.", investigation_id)
+                logger.info("[%s] Pipeline completed successfully with outcome: %s", investigation_id, result.outcome)
                 return result
 
             # Run all pipeline stages with total timeout guardrail
@@ -196,13 +232,23 @@ class InvestigationPipeline:
             logger.error("[%s] Investigation pipeline failed: %s", investigation_id, exc)
             failed_stage = result.status.value
             result.status = InvestigationStatus.FAILED
+            result.outcome = "FAILED"
             result.completed_at = datetime.now(timezone.utc).isoformat()
             result.tool_traces = all_traces
+
+            # Harvest any metrics generated before failure
+            err_metrics: List[GeminiRequestMetric] = []
+            if obs_agent:
+                err_metrics.extend(obs_agent.get_metrics())
+            if rem_planner:
+                err_metrics.extend(rem_planner.get_metrics())
+            result.gemini_metrics = err_metrics
+
             err_msg = str(exc).strip()
             if isinstance(exc, asyncio.TimeoutError) or not err_msg:
                 err_msg = f"Stage '{failed_stage}' timed out after {self.stage_timeout:.1f}s"
             result.error = {
-                "message": err_msg,
+                "message": sanitize_error_message(err_msg),
                 "type": type(exc).__name__,
                 "failed_at_status": failed_stage,
             }

@@ -144,3 +144,30 @@ class RemediationProposal(BaseModel):
                     "Remediation cannot safely be proposed due to insufficient evidence or risk of masking failure."
                 )
         return self
+
+
+class BatchProposalItem(BaseModel):
+    """Structured proposal item within a batch remediation response from Gemini."""
+    item_id: str = Field(..., description="Unique diagnosis identifier matching input item_id")
+    resource_name: Optional[str] = Field(default=None, description="Affected resource name (e.g. pod-name/container)")
+    status: str = Field(default="ACTIONABLE", description="ACTIONABLE or INSUFFICIENT_EVIDENCE")
+    can_remediate: bool = Field(default=True, description="Whether a safe, valid patch could be generated")
+    insufficient_evidence_reason: Optional[str] = Field(
+        default=None,
+        description="Detailed explanation if remediation cannot safely be proposed"
+    )
+    justification: str = Field(default="", description="Technical explanation and root cause alignment")
+    risk_level: str = Field(default="MEDIUM", description="Risk classification: LOW, MEDIUM, HIGH")
+    diff: Optional[str] = Field(default=None, description="Unified diff or declarative delta showing proposed change")
+    patch_content: Optional[Dict[str, Any]] = Field(
+        default=None,
+        description="Structured dictionary representation of the patch"
+    )
+
+
+class BatchRemediationResponse(BaseModel):
+    """Batch container for multi-incident remediation proposals from Gemini."""
+    proposals: List[BatchProposalItem] = Field(
+        default_factory=list,
+        description="List of proposed remediations matching each input diagnosis"
+    )

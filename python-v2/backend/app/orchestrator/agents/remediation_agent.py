@@ -13,14 +13,21 @@ import json
 import logging
 import os
 import re
-from typing import Any, Dict, List, Optional
+import time
+from typing import Any, Dict, List, Optional, Set
 import uuid
 
 from google.genai import Client, types
 
 from app.mcp_client import K8sMcpClientBridge
+from app.models.investigation import (
+    AgentToolCallTrace,
+    GeminiRequestMetric,
+)
 from app.models.remediation import (
     ApprovalStatus,
+    BatchProposalItem,
+    BatchRemediationResponse,
     HumanApproval,
     ProposalProvenance,
     ProposalStatus,
@@ -30,6 +37,7 @@ from app.models.remediation import (
     YamlPatch,
 )
 from app.orchestrator.prompts import REMEDIATION_AGENT_INSTRUCTION
+from app.orchestrator.sanitizer import sanitize_error_message
 from app.validators.safety_validator import (
     SafetyViolationError,
     validate_no_masking_commands,
@@ -146,10 +154,34 @@ def _extract_evidence_target_cpu(evidence_list: List[str]) -> Optional[str]:
     return None
 
 
+def _build_config_from_evidence(pod_evidence: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """Build a fallback resource configuration dictionary from observation evidence."""
+    if not pod_evidence:
+        return None
+    containers_config = []
+    for c in pod_evidence.get("containers", []):
+        spec = c.get("spec", {})
+        containers_config.append({
+            "name": c.get("name"),
+            "image": c.get("image"),
+            "resources": spec.get("resources", {}),
+            "probes": spec.get("probes", {}),
+        })
+    return {
+        "pod": pod_evidence.get("pod"),
+        "labels": pod_evidence.get("labels", {}),
+        "containers": containers_config,
+        "owners": pod_evidence.get("owners", []),
+        "related_resources": pod_evidence.get("related_resources", {}),
+    }
+
+
 class RemediationPlanner:
     """
     Formulates safe, grounded declarative YAML configuration remediations
     based on authoritative deterministic diagnoses and workload controller hierarchy.
+    Processes all diagnoses in a single batch Gemini request to optimize latency
+    and token consumption, while deduplicating MCP workload configuration queries.
     """
 
     def __init__(
@@ -161,6 +193,17 @@ class RemediationPlanner:
         self.bridge = bridge
         self.model_name = model_name or os.environ.get("GEMINI_MODEL", DEFAULT_GEMINI_MODEL)
         self.retry_options = retry_options or DEFAULT_RETRY_OPTIONS
+        self.traces: List[AgentToolCallTrace] = []
+        self.metrics: List[GeminiRequestMetric] = []
+        self.remediation_provenance: str = "DETERMINISTIC_FALLBACK"
+
+    def get_traces(self) -> List[AgentToolCallTrace]:
+        """Return MCP tool call traces recorded during remediation planning."""
+        return list(self.traces)
+
+    def get_metrics(self) -> List[GeminiRequestMetric]:
+        """Return instrumentation metrics captured for Gemini requests in this agent."""
+        return list(self.metrics)
 
     async def plan_remediations(
         self,
@@ -171,6 +214,8 @@ class RemediationPlanner:
     ) -> List[RemediationProposal]:
         """
         Generate remediation proposals for a list of authoritative diagnoses.
+        Deduplicates MCP configuration calls and batches all diagnoses into a single
+        Gemini request to optimize latency and token consumption.
 
         Args:
             diagnoses: Authoritative deterministic diagnoses.
@@ -182,20 +227,74 @@ class RemediationPlanner:
         Returns:
             List of validated RemediationProposal objects.
         """
+        t_plan_start = time.time()
+        self.traces = []
+        self.metrics = []
+        self.remediation_provenance = "DETERMINISTIC_FALLBACK"
+
         if not diagnoses:
             return []
 
         observed_pod_names = [p.get("pod") for p in (observed_pods or []) if p.get("pod")]
-        proposals: List[RemediationProposal] = []
-
         api_key = os.environ.get("GEMINI_API_KEY")
 
+        # 1. Deduplicate and collect workload configurations via MCP
+        unique_pod_names: Set[str] = set()
         for diag in diagnoses:
-            failure_type = diag.get("failure_type", "UNKNOWN")
+            r_name = diag.get("resource_name", "")
+            p_name = diag.get("pod") or (r_name.split("/")[0] if r_name else None)
+            if p_name:
+                unique_pod_names.add(p_name)
+
+        resource_configs: Dict[str, Dict[str, Any]] = {}
+        if self.bridge and self.bridge.is_connected:
+            for p_name in sorted(unique_pod_names):
+                if not p_name or p_name in resource_configs:
+                    continue
+                t_tool_0 = time.time()
+                try:
+                    config_res = await self.bridge.call_tool(
+                        "get_resource_config",
+                        {"namespace": namespace, "pod_name": p_name},
+                    )
+                    t_tool_ms = (time.time() - t_tool_0) * 1000.0
+                    success = bool(config_res.get("success"))
+                    if success:
+                        resource_configs[p_name] = config_res.get("data")
+                    data_obj = config_res.get("data") or {}
+                    keys_summary = list(data_obj.keys()) if isinstance(data_obj, dict) else []
+                    self.traces.append(
+                        AgentToolCallTrace(
+                            agent_name="remediation_planner",
+                            tool_name="get_resource_config",
+                            arguments={"namespace": namespace, "pod_name": p_name},
+                            status="SUCCESS" if success else "ERROR",
+                            duration_ms=t_tool_ms,
+                            result_summary=f"Workload config retrieved (keys: {keys_summary})" if success else "Failed to retrieve workload config",
+                            error_message=sanitize_error_message(str(config_res.get("error"))) if not success else None,
+                        )
+                    )
+                except Exception as exc:
+                    t_tool_ms = (time.time() - t_tool_0) * 1000.0
+                    logger.warning("Failed to fetch resource config for pod '%s': %s", p_name, exc)
+                    self.traces.append(
+                        AgentToolCallTrace(
+                            agent_name="remediation_planner",
+                            tool_name="get_resource_config",
+                            arguments={"namespace": namespace, "pod_name": p_name},
+                            status="ERROR",
+                            duration_ms=t_tool_ms,
+                            result_summary=None,
+                            error_message=sanitize_error_message(str(exc)),
+                        )
+                    )
+
+        # 2. Build structured diagnosis batch items
+        batch_items: List[Dict[str, Any]] = []
+        for idx, diag in enumerate(diagnoses):
             resource_name = diag.get("resource_name", "unknown")
             pod_name = diag.get("pod") or resource_name.split("/")[0]
 
-            # Find matching pod evidence
             pod_evidence = None
             if observed_pods:
                 for p in observed_pods:
@@ -203,122 +302,340 @@ class RemediationPlanner:
                         pod_evidence = p
                         break
 
-            # Resolve controller ownership
             target_info = resolve_workload_target(pod_name, pod_evidence)
+            r_config = resource_configs.get(pod_name) or _build_config_from_evidence(pod_evidence)
 
-            # 1. Fetch current resource configuration via MCP if bridge is available
-            resource_config: Optional[Dict[str, Any]] = None
-            if self.bridge and self.bridge.is_connected:
-                config_res = await self.bridge.call_tool(
-                    "get_resource_config",
-                    {"namespace": namespace, "pod_name": pod_name},
+            item_id = f"diag_{idx}_{pod_name}"
+            batch_items.append({
+                "item_id": item_id,
+                "diag": diag,
+                "pod_name": pod_name,
+                "resource_name": resource_name,
+                "target_info": target_info,
+                "resource_config": r_config,
+                "pod_evidence": pod_evidence,
+            })
+
+        # 3. Plan with Gemini in ONE batch request if LLM is enabled and API key is present
+        raw_batch_proposals: Dict[str, Dict[str, Any]] = {}
+        gemini_failed: bool = False
+        gemini_error: Optional[str] = None
+
+        if use_llm and api_key:
+            try:
+                raw_batch_proposals = await self._plan_batch_with_gemini(
+                    batch_items=batch_items,
+                    namespace=namespace,
                 )
-                if config_res.get("success"):
-                    resource_config = config_res.get("data")
+                if raw_batch_proposals:
+                    self.remediation_provenance = "GEMINI_AGENT"
+            except Exception as exc:
+                logger.warning(
+                    "Gemini batch remediation planning failed (%s), falling back to grounded templates",
+                    exc,
+                )
+                gemini_failed = True
+                gemini_error = sanitize_error_message(str(exc))
+                raw_batch_proposals = {}
 
-            # 2. Plan remediation via Gemini if enabled and API key is present
-            proposal: Optional[RemediationProposal] = None
-            if use_llm and api_key:
-                try:
-                    proposal = await self._plan_with_gemini(
+        # 4. Construct and validate individual proposals
+        proposals: List[RemediationProposal] = []
+        for item in batch_items:
+            item_id = item["item_id"]
+            diag = item["diag"]
+            pod_name = item["pod_name"]
+            resource_name = item["resource_name"]
+            target_info = item["target_info"]
+            r_config = item["resource_config"]
+            pod_evidence = item["pod_evidence"]
+
+            proposal = None
+            if use_llm and api_key and not gemini_failed:
+                item_data = raw_batch_proposals.get(item_id) or raw_batch_proposals.get(resource_name)
+                if item_data:
+                    proposal = self._parse_single_proposal(
+                        item_data=item_data,
                         diag=diag,
                         namespace=namespace,
                         pod_name=pod_name,
                         target_info=target_info,
-                        resource_config=resource_config,
                         pod_evidence=pod_evidence,
                     )
-                except Exception as exc:
-                    logger.warning("Gemini remediation planning failed (%s), falling back to grounded template", exc)
-                    proposal = None
+                else:
+                    logger.warning(
+                        "Diagnosis '%s' was missing or ambiguous in Gemini batch response; using safe deterministic fallback.",
+                        item_id,
+                    )
+                    proposal = self._generate_grounded_proposal(
+                        diag=diag,
+                        namespace=namespace,
+                        pod_name=pod_name,
+                        target_info=target_info,
+                        resource_config=r_config,
+                        pod_evidence=pod_evidence,
+                    )
 
-            # 3. Grounded fallback generator (ensures deterministic reliability without API key)
+            # Grounded fallback if LLM not used or failed
             if proposal is None:
                 proposal = self._generate_grounded_proposal(
                     diag=diag,
                     namespace=namespace,
                     pod_name=pod_name,
                     target_info=target_info,
-                    resource_config=resource_config,
+                    resource_config=r_config,
                     pod_evidence=pod_evidence,
                 )
 
-            # 4. Strict safety validation
+            # 5. Independent safety validation
             if proposal:
-                validate_remediation_proposal(
-                    proposal=proposal,
-                    deterministic_diagnoses=diagnoses,
-                    observed_pod_names=observed_pod_names or [pod_name],
-                    pod_evidence=pod_evidence,
-                )
+                try:
+                    validate_remediation_proposal(
+                        proposal=proposal,
+                        deterministic_diagnoses=diagnoses,
+                        observed_pod_names=observed_pod_names or [pod_name],
+                        pod_evidence=pod_evidence,
+                    )
+                except SafetyViolationError as exc:
+                    logger.warning("Safety validation failed for proposal '%s': %s", proposal.target_workload, exc)
+                    proposal = RemediationProposal(
+                        target_workload=pod_name,
+                        target_kind=target_info["target_kind"],
+                        target_name=target_info["target_name"],
+                        target_namespace=namespace,
+                        status=ProposalStatus.REJECTED_SAFETY_VIOLATION,
+                        can_remediate=False,
+                        insufficient_evidence_reason=f"Safety violation: {exc}",
+                        patch=None,
+                        justification="Remediation rejected by safety validator.",
+                        risk_level=RiskLevel.HIGH,
+                        requires_approval=True,
+                        approval=HumanApproval(status=ApprovalStatus.PENDING),
+                        provenance=proposal.provenance,
+                        model_metadata=proposal.model_metadata,
+                    )
                 proposals.append(proposal)
+
+        # Record batch planning activity trace
+        self.traces.append(
+            AgentToolCallTrace(
+                agent_name="remediation_planner",
+                tool_name="plan_batch_remediation",
+                arguments={"batch_size": len(batch_items), "namespace": namespace},
+                status="SUCCESS" if (not gemini_failed and self.remediation_provenance == "GEMINI_AGENT") else "FALLBACK",
+                duration_ms=(time.time() - t_plan_start) * 1000.0,
+                result_summary=f"Generated {len(proposals)} proposals ({self.remediation_provenance})",
+                error_message=gemini_error if gemini_failed else None,
+            )
+        )
 
         return proposals
 
-    async def _plan_with_gemini(
+    async def _plan_batch_with_gemini(
         self,
+        batch_items: List[Dict[str, Any]],
+        namespace: str,
+    ) -> Dict[str, Dict[str, Any]]:
+        """Invoke Gemini ONCE to generate remediation proposals for all diagnoses in the batch."""
+        started_at = datetime.now(timezone.utc).isoformat()
+        t0 = time.time()
+        metric = GeminiRequestMetric(
+            stage="REMEDIATION",
+            model=self.model_name,
+            started_at=started_at,
+        )
+
+        client = Client(http_options=types.HttpOptions(retry_options=self.retry_options))
+
+        formatted_items = []
+        for item in batch_items:
+            diag = item["diag"]
+            target_info = item["target_info"]
+            r_cfg = item["resource_config"] or {}
+
+            formatted_items.append({
+                "item_id": item["item_id"],
+                "resource_name": item["resource_name"],
+                "pod_name": item["pod_name"],
+                "failure_type": diag.get("failure_type"),
+                "severity": diag.get("severity"),
+                "root_cause": diag.get("root_cause"),
+                "evidence": diag.get("evidence", []),
+                "recommended_action": diag.get("recommended_action"),
+                "target_resource": {
+                    "target_kind": target_info["target_kind"],
+                    "target_name": target_info["target_name"],
+                    "is_standalone_pod": target_info["is_standalone_pod"],
+                    "owning_controller": f"{target_info.get('owner_kind')}/{target_info.get('owner_name')}"
+                    if target_info.get("owner_kind")
+                    else None,
+                },
+                "workload_config": r_cfg,
+            })
+
+        prompt = f"""
+Namespace: {namespace}
+Total Diagnoses: {len(formatted_items)}
+
+Diagnoses to Remediate:
+{json.dumps(formatted_items, indent=2)}
+
+Task:
+For EACH diagnosis in the list above, formulate a safe declarative YAML patch and unified diff targeting the controller or standalone Pod, OR return INSUFFICIENT_EVIDENCE if an automated fix cannot safely be determined without inventing commands, images, or configuration.
+
+Strict Safety and Correctness Guardrails:
+1. Provide a separate proposal for EVERY diagnosis in the input list, referencing its exact "item_id" and "resource_name".
+2. ABSOLUTELY NO MASKING COMMANDS: NEVER propose placeholder commands like 'sleep 3600', 'true', '/bin/true', 'tail -f /dev/null', 'pause', or infinite loops.
+3. GROUNDED SIZING ONLY: NEVER propose arbitrary resource sizing (such as guessing memory limits or CPU requests) unless the required sizing is explicitly justified by and present in the collected evidence. If evidence does not provide the required sizing, return INSUFFICIENT_EVIDENCE.
+4. UNKNOWN INTENT: If developer intent or required values (e.g. valid image tag, secret values, internal application code) cannot be proven from evidence, return INSUFFICIENT_EVIDENCE with can_remediate=false and patch=null.
+
+Respond in strict JSON with schema:
+{{
+  "proposals": [
+    {{
+      "item_id": "<must match input item_id exactly>",
+      "resource_name": "<must match input resource_name exactly>",
+      "status": "ACTIONABLE" | "INSUFFICIENT_EVIDENCE",
+      "can_remediate": true | false,
+      "insufficient_evidence_reason": "<explanation if can_remediate is false, otherwise null>",
+      "justification": "<concise technical justification aligned with root cause>",
+      "risk_level": "LOW" | "MEDIUM" | "HIGH",
+      "diff": "<unified diff string, or null if can_remediate is false>",
+      "patch_content": {{ ... JSON structure of patch, or null if can_remediate is false ... }}
+    }}
+  ]
+}}
+"""
+        try:
+            response = await client.aio.models.generate_content(
+                model=self.model_name,
+                contents=prompt,
+                config=types.GenerateContentConfig(
+                    system_instruction=REMEDIATION_AGENT_INSTRUCTION,
+                    response_mime_type="application/json",
+                    temperature=0.1,
+                ),
+            )
+            dur_ms = (time.time() - t0) * 1000.0
+            metric.completed_at = datetime.now(timezone.utc).isoformat()
+            metric.duration_ms = dur_ms
+            metric.success = True
+            sdk_resp = getattr(response, "sdk_http_response", None)
+            code = getattr(sdk_resp, "status_code", None) or getattr(response, "status_code", None)
+            if isinstance(code, int):
+                metric.status_code = code
+            self.metrics.append(metric)
+
+            if not response.text:
+                return {}
+
+            return self._parse_batch_response_text(response.text, batch_items)
+        except Exception as exc:
+            dur_ms = (time.time() - t0) * 1000.0
+            metric.completed_at = datetime.now(timezone.utc).isoformat()
+            metric.duration_ms = dur_ms
+            metric.success = False
+            metric.error_type = type(exc).__name__
+            sanitized_err = sanitize_error_message(str(exc))
+            metric.error_message = sanitized_err
+            code = getattr(exc, "code", None) or getattr(exc, "status_code", None)
+            if isinstance(code, int):
+                metric.status_code = code
+            retries = getattr(exc, "attempts", None) or getattr(exc, "retry_count", None)
+            if isinstance(retries, int):
+                metric.retries_attempted = retries
+            metric.fallback_triggered = True
+            metric.fallback_reason = f"Gemini batch remediation failed with {type(exc).__name__}: {sanitized_err}"
+            self.metrics.append(metric)
+            raise
+
+    def _parse_batch_response_text(
+        self,
+        text: str,
+        batch_items: List[Dict[str, Any]],
+    ) -> Dict[str, Dict[str, Any]]:
+        """
+        Defensively parse raw batch response text from Gemini into a map of proposal data.
+        Handles variations: {"proposals": [...]}, list of dicts, or single dict when len(batch_items) == 1.
+        Filters out ambiguous or conflicting duplicate items.
+        """
+        try:
+            raw = json.loads(text.strip())
+        except Exception as exc:
+            logger.warning("Failed to decode JSON from Gemini batch response: %s", exc)
+            return {}
+
+        items: List[Any] = []
+        if isinstance(raw, dict):
+            if "proposals" in raw and isinstance(raw["proposals"], list):
+                items = raw["proposals"]
+            elif "items" in raw and isinstance(raw["items"], list):
+                items = raw["items"]
+            elif "remediations" in raw and isinstance(raw["remediations"], list):
+                items = raw["remediations"]
+            elif len(batch_items) == 1 and ("status" in raw or "can_remediate" in raw):
+                single_item = dict(raw)
+                single_item.setdefault("item_id", batch_items[0]["item_id"])
+                single_item.setdefault("resource_name", batch_items[0]["resource_name"])
+                items = [single_item]
+        elif isinstance(raw, list):
+            items = raw
+
+        proposals_by_id: Dict[str, Dict[str, Any]] = {}
+        seen_ids: Dict[str, int] = {}
+        conflicting_keys: Set[str] = set()
+
+        for idx, item in enumerate(items):
+            if not isinstance(item, dict):
+                continue
+            iid = item.get("item_id")
+            rname = item.get("resource_name")
+
+            if not iid and idx < len(batch_items):
+                if not rname or rname == batch_items[idx]["resource_name"]:
+                    iid = batch_items[idx]["item_id"]
+                    item["item_id"] = iid
+
+            if iid:
+                if iid in seen_ids:
+                    prev = proposals_by_id.get(iid)
+                    if prev != item:
+                        conflicting_keys.add(iid)
+                        if rname:
+                            conflicting_keys.add(rname)
+                else:
+                    seen_ids[iid] = 1
+                    proposals_by_id[iid] = item
+
+            if rname:
+                if rname in seen_ids and rname != iid:
+                    prev = proposals_by_id.get(rname)
+                    if prev != item:
+                        conflicting_keys.add(rname)
+                        if iid:
+                            conflicting_keys.add(iid)
+                else:
+                    seen_ids[rname] = 1
+                    proposals_by_id[rname] = item
+
+        for ck in conflicting_keys:
+            logger.warning("Conflicting duplicate proposal detected for '%s'; discarding duplicate.", ck)
+            proposals_by_id.pop(ck, None)
+
+        return proposals_by_id
+
+    def _parse_single_proposal(
+        self,
+        item_data: Dict[str, Any],
         diag: Dict[str, Any],
         namespace: str,
         pod_name: str,
         target_info: Dict[str, Any],
-        resource_config: Optional[Dict[str, Any]],
         pod_evidence: Optional[Dict[str, Any]],
-    ) -> Optional[RemediationProposal]:
-        """Invoke Gemini to formulate a structured remediation proposal."""
-        client = Client(http_options=types.HttpOptions(retry_options=self.retry_options))
+    ) -> RemediationProposal:
+        """Construct a validated RemediationProposal from parsed LLM proposal data."""
+        status_str = str(item_data.get("status", "ACTIONABLE")).upper()
+        can_rem = bool(item_data.get("can_remediate", True))
 
-        prompt = f"""
-Deterministic Diagnosis:
-- Resource: {diag.get('resource_name')}
-- Failure Type: {diag.get('failure_type')}
-- Severity: {diag.get('severity')}
-- Root Cause: {diag.get('root_cause')}
-- Evidence: {json.dumps(diag.get('evidence', []))}
-- Recommended Action: {diag.get('recommended_action')}
-
-Target Resource Ownership:
-- Target Kind: {target_info['target_kind']}
-- Target Name: {target_info['target_name']}
-- Is Standalone Pod: {target_info['is_standalone_pod']}
-- Owning Controller: {target_info.get('owner_kind')}/{target_info.get('owner_name')}
-
-Observed Workload Configuration:
-{json.dumps(resource_config or {}, indent=2)}
-
-Task:
-Propose a declarative YAML patch and unified diff to remediate this incident, OR return INSUFFICIENT_EVIDENCE if safe automated remediation cannot be formulated without inventing commands, images, or configuration.
-NEVER propose placeholder commands like 'sleep 3600', 'true', or commands that merely keep a container alive.
-NEVER propose arbitrary resource sizing (such as guessing memory limits or CPU requests) unless the required sizing is explicitly justified by and present in the collected evidence. If evidence does not provide the required sizing, return INSUFFICIENT_EVIDENCE.
-
-Respond in strict JSON with keys:
-{{
-  "status": "ACTIONABLE" | "INSUFFICIENT_EVIDENCE",
-  "can_remediate": true | false,
-  "insufficient_evidence_reason": "<explanation if can_remediate is false, otherwise null>",
-  "justification": "<concise technical justification aligned with root cause>",
-  "risk_level": "LOW" | "MEDIUM" | "HIGH",
-  "diff": "<unified diff string, or null if can_remediate is false>",
-  "patch_content": {{ ... JSON structure of patch, or null if can_remediate is false ... }}
-}}
-"""
-        response = await client.aio.models.generate_content(
-            model=self.model_name,
-            contents=prompt,
-            config=types.GenerateContentConfig(
-                system_instruction=REMEDIATION_AGENT_INSTRUCTION,
-                response_mime_type="application/json",
-                temperature=0.1,
-            ),
-        )
-
-        if not response.text:
-            return None
-
-        data = json.loads(response.text)
-        status_str = str(data.get("status", "ACTIONABLE")).upper()
-        can_rem = bool(data.get("can_remediate", True))
-
-        # Check for insufficient evidence
         if status_str == "INSUFFICIENT_EVIDENCE" or not can_rem:
             return RemediationProposal(
                 target_workload=pod_name,
@@ -327,12 +644,15 @@ Respond in strict JSON with keys:
                 target_namespace=namespace,
                 status=ProposalStatus.INSUFFICIENT_EVIDENCE,
                 can_remediate=False,
-                insufficient_evidence_reason=data.get(
+                insufficient_evidence_reason=item_data.get(
                     "insufficient_evidence_reason",
                     "Remediation withheld due to insufficient supporting evidence."
                 ),
                 patch=None,
-                justification=data.get("justification", "Remediation withheld: manual operator intervention required."),
+                justification=item_data.get(
+                    "justification",
+                    "Remediation withheld: manual operator intervention required."
+                ),
                 risk_level=RiskLevel.MEDIUM,
                 requires_approval=True,
                 approval=HumanApproval(status=ApprovalStatus.PENDING),
@@ -340,8 +660,8 @@ Respond in strict JSON with keys:
                 model_metadata={"model": self.model_name, "provider": "google_genai"},
             )
 
-        diff = data.get("diff", "")
-        patch_content = data.get("patch_content", {})
+        diff = item_data.get("diff", "")
+        patch_content = item_data.get("patch_content", {})
 
         # Strict check against placeholder/masking commands from LLM
         try:
@@ -365,7 +685,7 @@ Respond in strict JSON with keys:
                 model_metadata={"model": self.model_name, "provider": "google_genai"},
             )
 
-        risk_str = str(data.get("risk_level", "MEDIUM")).upper()
+        risk_str = str(item_data.get("risk_level", "MEDIUM")).upper()
         risk_level = RiskLevel[risk_str] if risk_str in RiskLevel.__members__ else RiskLevel.MEDIUM
 
         yaml_patch = YamlPatch(
@@ -373,7 +693,7 @@ Respond in strict JSON with keys:
             target_name=target_info["target_name"],
             target_namespace=namespace,
             diff=diff,
-            patch_content=patch_content,
+            patch_content=patch_content if isinstance(patch_content, dict) else {},
         )
 
         # Strict check against ungrounded resource sizing from LLM
@@ -419,12 +739,44 @@ Respond in strict JSON with keys:
             status=ProposalStatus.ACTIONABLE,
             can_remediate=True,
             patch=yaml_patch,
-            justification=data.get("justification", diag.get("recommended_action", "Remediation recommended")),
+            justification=item_data.get("justification", diag.get("recommended_action", "Remediation recommended")),
             risk_level=risk_level,
             requires_approval=True,
             approval=HumanApproval(status=ApprovalStatus.PENDING),
             provenance=ProposalProvenance.GEMINI_AGENT,
             model_metadata={"model": self.model_name, "provider": "google_genai"},
+        )
+
+    async def _plan_with_gemini(
+        self,
+        diag: Dict[str, Any],
+        namespace: str,
+        pod_name: str,
+        target_info: Dict[str, Any],
+        resource_config: Optional[Dict[str, Any]],
+        pod_evidence: Optional[Dict[str, Any]],
+    ) -> Optional[RemediationProposal]:
+        """Backward-compatible single-diagnosis invocation delegating to batch planner."""
+        batch_items = [{
+            "item_id": f"diag_0_{pod_name}",
+            "diag": diag,
+            "pod_name": pod_name,
+            "resource_name": diag.get("resource_name", pod_name),
+            "target_info": target_info,
+            "resource_config": resource_config,
+            "pod_evidence": pod_evidence,
+        }]
+        batch_results = await self._plan_batch_with_gemini(batch_items, namespace)
+        item_data = batch_results.get(f"diag_0_{pod_name}") or batch_results.get(diag.get("resource_name", pod_name))
+        if not item_data:
+            return None
+        return self._parse_single_proposal(
+            item_data=item_data,
+            diag=diag,
+            namespace=namespace,
+            pod_name=pod_name,
+            target_info=target_info,
+            pod_evidence=pod_evidence,
         )
 
     def _generate_grounded_proposal(

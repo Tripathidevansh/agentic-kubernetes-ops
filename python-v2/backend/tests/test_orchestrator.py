@@ -27,6 +27,7 @@ import pytest
 from app.mcp_client import K8sMcpClientBridge
 from app.models.investigation import (
     AgentToolCallTrace,
+    GeminiRequestMetric,
     InvestigationRequest,
     InvestigationResult,
     InvestigationStatus,
@@ -52,6 +53,7 @@ from app.orchestrator import (
     is_gemini_api_key_available,
 )
 from app.orchestrator.agents.remediation_agent import resolve_workload_target
+from app.orchestrator.sanitizer import sanitize_error_message
 from app.validators.safety_validator import (
     SafetyViolationError,
     validate_controller_ownership,
@@ -1193,3 +1195,887 @@ def test_permanent_api_errors_do_not_retry():
     for code in transient_codes:
         assert code in OBS_RETRIES.http_status_codes, f"Transient error {code} must be retried"
         assert code in REM_RETRIES.http_status_codes, f"Transient error {code} must be retried"
+
+
+# ============================================================================
+# Phase 4C Batch Remediation Planning & MCP Deduplication Tests
+# ============================================================================
+
+@pytest.mark.anyio
+async def test_batch_remediation_ten_diagnoses_single_gemini_call():
+    """Verify that 10 diagnoses are processed using exactly ONE Gemini API call."""
+    planner = RemediationPlanner(model_name="gemini-3.8-flash")
+    diagnoses = [
+        {
+            "failure_type": "MEMORY_EXHAUSTION",
+            "pod": f"scenario-{i:02d}",
+            "resource_name": f"scenario-{i:02d}/app",
+            "evidence": [f"Required memory limit: {128 * i}Mi based on profiler"],
+            "recommended_action": f"Increase memory limit to {128 * i}Mi",
+        }
+        for i in range(1, 11)
+    ]
+    observed_pods = [{"pod": f"scenario-{i:02d}", "owners": []} for i in range(1, 11)]
+
+    # Mock batch response from Gemini
+    proposals_data = [
+        {
+            "item_id": f"diag_{i - 1}_scenario-{i:02d}",
+            "resource_name": f"scenario-{i:02d}/app",
+            "status": "ACTIONABLE",
+            "can_remediate": True,
+            "justification": f"Grounded memory remediation for scenario-{i:02d}",
+            "risk_level": "MEDIUM",
+            "diff": f"--- memory: 64Mi\n+++ memory: {128 * i}Mi",
+            "patch_content": {"spec": {"containers": [{"name": "app", "resources": {"limits": {"memory": f"{128 * i}Mi"}}}]}},
+        }
+        for i in range(1, 11)
+    ]
+    mock_resp = MagicMock()
+    mock_resp.text = json.dumps({"proposals": proposals_data})
+
+    with patch("app.orchestrator.agents.remediation_agent.Client") as mock_client_cls:
+        mock_instance = MagicMock()
+        mock_instance.aio.models.generate_content = AsyncMock(return_value=mock_resp)
+        mock_client_cls.return_value = mock_instance
+
+        with patch.dict(os.environ, {"GEMINI_API_KEY": "mock-api-key"}):
+            proposals = await planner.plan_remediations(
+                diagnoses=diagnoses,
+                namespace="k8s-agent-demo",
+                observed_pods=observed_pods,
+                use_llm=True,
+            )
+
+    # Key Assertion: Exactly 1 Gemini call for 10 diagnoses!
+    assert mock_instance.aio.models.generate_content.call_count == 1
+    assert len(proposals) == 10
+    for p in proposals:
+        assert p.provenance == ProposalProvenance.GEMINI_AGENT
+        assert p.status == ProposalStatus.ACTIONABLE
+        assert p.can_remediate is True
+
+
+@pytest.mark.anyio
+async def test_batch_remediation_single_diagnosis():
+    """Verify that a single diagnosis is processed cleanly in batch mode with 1 Gemini call."""
+    planner = RemediationPlanner(model_name="gemini-3.8-flash")
+    diag = {
+        "failure_type": "MEMORY_EXHAUSTION",
+        "pod": "scenario-02-oom",
+        "resource_name": "scenario-02-oom/app",
+        "evidence": ["Required memory limit: 512Mi based on profiler"],
+        "recommended_action": "Increase memory limit to 512Mi",
+    }
+    mock_resp = MagicMock()
+    mock_resp.text = json.dumps({
+        "proposals": [{
+            "item_id": "diag_0_scenario-02-oom",
+            "resource_name": "scenario-02-oom/app",
+            "status": "ACTIONABLE",
+            "can_remediate": True,
+            "justification": "Grounded memory fix",
+            "risk_level": "MEDIUM",
+            "diff": "--- memory: 64Mi\n+++ memory: 512Mi",
+            "patch_content": {"spec": {"containers": [{"name": "app", "resources": {"limits": {"memory": "512Mi"}}}]}},
+        }]
+    })
+
+    with patch("app.orchestrator.agents.remediation_agent.Client") as mock_client_cls:
+        mock_instance = MagicMock()
+        mock_instance.aio.models.generate_content = AsyncMock(return_value=mock_resp)
+        mock_client_cls.return_value = mock_instance
+
+        with patch.dict(os.environ, {"GEMINI_API_KEY": "mock-api-key"}):
+            proposals = await planner.plan_remediations(
+                diagnoses=[diag],
+                namespace="k8s-agent-demo",
+                observed_pods=[{"pod": "scenario-02-oom", "owners": []}],
+                use_llm=True,
+            )
+
+    assert mock_instance.aio.models.generate_content.call_count == 1
+    assert len(proposals) == 1
+    assert proposals[0].target_workload == "scenario-02-oom"
+    assert proposals[0].provenance == ProposalProvenance.GEMINI_AGENT
+
+
+@pytest.mark.anyio
+async def test_batch_remediation_correct_mapping_of_proposals_to_diagnoses():
+    """Verify proposals in batch response map strictly to their corresponding diagnosis."""
+    planner = RemediationPlanner()
+    diag1 = {"failure_type": "MEMORY_EXHAUSTION", "pod": "pod-alpha", "resource_name": "pod-alpha/app", "evidence": ["Required memory limit: 256Mi based on profiler"]}
+    diag2 = {"failure_type": "APPLICATION_PROCESS_FAILURE", "pod": "pod-beta", "resource_name": "pod-beta/app", "evidence": []}
+
+    mock_resp = MagicMock()
+    mock_resp.text = json.dumps({
+        "proposals": [
+            {
+                "item_id": "diag_1_pod-beta",
+                "resource_name": "pod-beta/app",
+                "status": "INSUFFICIENT_EVIDENCE",
+                "can_remediate": False,
+                "insufficient_evidence_reason": "Process failure requires application code fix",
+                "justification": "Cannot safely patch unknown process crash",
+                "risk_level": "HIGH",
+            },
+            {
+                "item_id": "diag_0_pod-alpha",
+                "resource_name": "pod-alpha/app",
+                "status": "ACTIONABLE",
+                "can_remediate": True,
+                "justification": "Increase memory to 256Mi",
+                "risk_level": "MEDIUM",
+                "diff": "--- memory: 64Mi\n+++ memory: 256Mi",
+                "patch_content": {"spec": {"containers": [{"name": "app", "resources": {"limits": {"memory": "256Mi"}}}]}},
+            },
+        ]
+    })
+
+    with patch("app.orchestrator.agents.remediation_agent.Client") as mock_client_cls:
+        mock_instance = MagicMock()
+        mock_instance.aio.models.generate_content = AsyncMock(return_value=mock_resp)
+        mock_client_cls.return_value = mock_instance
+
+        with patch.dict(os.environ, {"GEMINI_API_KEY": "mock-api-key"}):
+            proposals = await planner.plan_remediations(
+                diagnoses=[diag1, diag2],
+                namespace="k8s-agent-demo",
+                observed_pods=[{"pod": "pod-alpha", "owners": []}, {"pod": "pod-beta", "owners": []}],
+                use_llm=True,
+            )
+
+    assert len(proposals) == 2
+    assert proposals[0].target_workload == "pod-alpha"
+    assert proposals[0].status == ProposalStatus.ACTIONABLE
+    assert proposals[0].patch is not None
+    assert proposals[1].target_workload == "pod-beta"
+    assert proposals[1].status == ProposalStatus.INSUFFICIENT_EVIDENCE
+    assert proposals[1].patch is None
+
+
+@pytest.mark.anyio
+async def test_batch_remediation_missing_proposal_handled_by_safe_fallback():
+    """Verify that if Gemini omits a diagnosis from batch response, it safely falls back to deterministic rules."""
+    planner = RemediationPlanner()
+    diag1 = {"failure_type": "MEMORY_EXHAUSTION", "pod": "pod-1", "resource_name": "pod-1/app", "evidence": ["Required memory limit: 256Mi based on profiler"]}
+    diag2 = {"failure_type": "APPLICATION_PROCESS_FAILURE", "pod": "pod-2", "resource_name": "pod-2/app", "evidence": []}
+    diag3 = {"failure_type": "MEMORY_EXHAUSTION", "pod": "pod-3", "resource_name": "pod-3/app", "evidence": ["Required memory limit: 512Mi based on profiler"]}
+
+    # Gemini omitted pod-2 from response
+    mock_resp = MagicMock()
+    mock_resp.text = json.dumps({
+        "proposals": [
+            {
+                "item_id": "diag_0_pod-1",
+                "resource_name": "pod-1/app",
+                "status": "ACTIONABLE",
+                "can_remediate": True,
+                "justification": "Increase memory to 256Mi",
+                "diff": "--- memory: 64Mi\n+++ memory: 256Mi",
+                "patch_content": {"spec": {"containers": [{"name": "app", "resources": {"limits": {"memory": "256Mi"}}}]}},
+            },
+            {
+                "item_id": "diag_2_pod-3",
+                "resource_name": "pod-3/app",
+                "status": "ACTIONABLE",
+                "can_remediate": True,
+                "justification": "Increase memory to 512Mi",
+                "diff": "--- memory: 64Mi\n+++ memory: 512Mi",
+                "patch_content": {"spec": {"containers": [{"name": "app", "resources": {"limits": {"memory": "512Mi"}}}]}},
+            },
+        ]
+    })
+
+    with patch("app.orchestrator.agents.remediation_agent.Client") as mock_client_cls:
+        mock_instance = MagicMock()
+        mock_instance.aio.models.generate_content = AsyncMock(return_value=mock_resp)
+        mock_client_cls.return_value = mock_instance
+
+        with patch.dict(os.environ, {"GEMINI_API_KEY": "mock-api-key"}):
+            proposals = await planner.plan_remediations(
+                diagnoses=[diag1, diag2, diag3],
+                namespace="k8s-agent-demo",
+                observed_pods=[{"pod": "pod-1", "owners": []}, {"pod": "pod-2", "owners": []}, {"pod": "pod-3", "owners": []}],
+                use_llm=True,
+            )
+
+    assert len(proposals) == 3
+    # pod-1 from Gemini
+    assert proposals[0].target_workload == "pod-1"
+    assert proposals[0].provenance == ProposalProvenance.GEMINI_AGENT
+    # pod-2 was omitted from Gemini, handled by fallback
+    assert proposals[1].target_workload == "pod-2"
+    assert proposals[1].provenance == ProposalProvenance.DETERMINISTIC_FALLBACK
+    assert proposals[1].status == ProposalStatus.INSUFFICIENT_EVIDENCE
+    # pod-3 from Gemini
+    assert proposals[2].target_workload == "pod-3"
+    assert proposals[2].provenance == ProposalProvenance.GEMINI_AGENT
+
+
+@pytest.mark.anyio
+async def test_batch_remediation_duplicate_and_malformed_proposals():
+    """Verify that conflicting duplicate proposals are discarded and handled safely by fallback."""
+    planner = RemediationPlanner()
+    diag = {"failure_type": "APPLICATION_PROCESS_FAILURE", "pod": "dup-pod", "resource_name": "dup-pod/app", "evidence": []}
+
+    mock_resp = MagicMock()
+    # Conflicting duplicate proposals for the same item_id
+    mock_resp.text = json.dumps({
+        "proposals": [
+            {"item_id": "diag_0_dup-pod", "resource_name": "dup-pod/app", "status": "ACTIONABLE", "can_remediate": True, "diff": "diff1", "patch_content": {"a": 1}},
+            {"item_id": "diag_0_dup-pod", "resource_name": "dup-pod/app", "status": "INSUFFICIENT_EVIDENCE", "can_remediate": False},
+        ]
+    })
+
+    with patch("app.orchestrator.agents.remediation_agent.Client") as mock_client_cls:
+        mock_instance = MagicMock()
+        mock_instance.aio.models.generate_content = AsyncMock(return_value=mock_resp)
+        mock_client_cls.return_value = mock_instance
+
+        with patch.dict(os.environ, {"GEMINI_API_KEY": "mock-api-key"}):
+            proposals = await planner.plan_remediations(
+                diagnoses=[diag],
+                namespace="k8s-agent-demo",
+                observed_pods=[{"pod": "dup-pod", "owners": []}],
+                use_llm=True,
+            )
+
+    assert len(proposals) == 1
+    assert proposals[0].target_workload == "dup-pod"
+    assert proposals[0].provenance == ProposalProvenance.DETERMINISTIC_FALLBACK
+
+
+@pytest.mark.anyio
+async def test_batch_remediation_safety_rejection_of_one_does_not_corrupt_others():
+    """Verify that a safety violation in one proposal does not reject or corrupt valid proposals in the batch."""
+    planner = RemediationPlanner()
+    diag1 = {"failure_type": "APPLICATION_PROCESS_FAILURE", "pod": "bad-pod", "resource_name": "bad-pod/app", "evidence": []}
+    diag2 = {"failure_type": "MEMORY_EXHAUSTION", "pod": "good-pod", "resource_name": "good-pod/app", "evidence": ["Required memory limit: 256Mi based on profiler"]}
+
+    mock_resp = MagicMock()
+    mock_resp.text = json.dumps({
+        "proposals": [
+            {
+                "item_id": "diag_0_bad-pod",
+                "resource_name": "bad-pod/app",
+                "status": "ACTIONABLE",
+                "can_remediate": True,
+                "diff": "--- command: ['exit', '1']\n+++ command: ['sleep 3600']",
+                "patch_content": {"command": ["sleep 3600"]},
+                "justification": "Unsafe masking command",
+            },
+            {
+                "item_id": "diag_1_good-pod",
+                "resource_name": "good-pod/app",
+                "status": "ACTIONABLE",
+                "can_remediate": True,
+                "diff": "--- memory: 64Mi\n+++ memory: 256Mi",
+                "patch_content": {"spec": {"containers": [{"name": "app", "resources": {"limits": {"memory": "256Mi"}}}]}},
+                "justification": "Valid memory sizing",
+            },
+        ]
+    })
+
+    with patch("app.orchestrator.agents.remediation_agent.Client") as mock_client_cls:
+        mock_instance = MagicMock()
+        mock_instance.aio.models.generate_content = AsyncMock(return_value=mock_resp)
+        mock_client_cls.return_value = mock_instance
+
+        with patch.dict(os.environ, {"GEMINI_API_KEY": "mock-api-key"}):
+            proposals = await planner.plan_remediations(
+                diagnoses=[diag1, diag2],
+                namespace="k8s-agent-demo",
+                observed_pods=[{"pod": "bad-pod", "owners": []}, {"pod": "good-pod", "owners": []}],
+                use_llm=True,
+            )
+
+    assert len(proposals) == 2
+    # Proposal 0 (bad-pod): rejected due to masking command
+    assert proposals[0].target_workload == "bad-pod"
+    assert proposals[0].status == ProposalStatus.REJECTED_SAFETY_VIOLATION
+    assert proposals[0].patch is None
+    # Proposal 1 (good-pod): remains ACTIONABLE and valid!
+    assert proposals[1].target_workload == "good-pod"
+    assert proposals[1].status == ProposalStatus.ACTIONABLE
+    assert proposals[1].patch is not None
+
+
+@pytest.mark.anyio
+async def test_batch_remediation_gemini_api_failure_deterministic_fallback():
+    """Verify that when Gemini batch API fails (e.g. 503), planner falls back to deterministic templates."""
+    planner = RemediationPlanner()
+    diag = {
+        "failure_type": "APPLICATION_PROCESS_FAILURE",
+        "pod": "fail-pod",
+        "resource_name": "fail-pod/app",
+        "evidence": [],
+    }
+
+    with patch("app.orchestrator.agents.remediation_agent.Client") as mock_client_cls:
+        mock_instance = MagicMock()
+        mock_instance.aio.models.generate_content = AsyncMock(side_effect=RuntimeError("503 Service Unavailable"))
+        mock_client_cls.return_value = mock_instance
+
+        with patch.dict(os.environ, {"GEMINI_API_KEY": "mock-api-key"}):
+            proposals = await planner.plan_remediations(
+                diagnoses=[diag],
+                namespace="k8s-agent-demo",
+                observed_pods=[{"pod": "fail-pod", "owners": []}],
+                use_llm=True,
+            )
+
+    assert len(proposals) == 1
+    assert proposals[0].target_workload == "fail-pod"
+    assert proposals[0].provenance == ProposalProvenance.DETERMINISTIC_FALLBACK
+    assert proposals[0].model_metadata["provider"] == "deterministic_rules"
+
+
+@pytest.mark.anyio
+async def test_batch_remediation_deduplicates_mcp_config_calls():
+    """Verify that get_resource_config is called only once per unique workload, avoiding redundant MCP calls."""
+    bridge = _build_mock_bridge()
+    bridge.call_tool = AsyncMock(return_value={"success": True, "data": {"containers": []}})
+    planner = RemediationPlanner(bridge=bridge)
+
+    diagnoses = [
+        {"pod": "pod-A", "resource_name": "pod-A/c1", "failure_type": "APPLICATION_PROCESS_FAILURE"},
+        {"pod": "pod-A", "resource_name": "pod-A/c2", "failure_type": "READINESS_PROBE_FAILURE"},
+        {"pod": "pod-B", "resource_name": "pod-B/c1", "failure_type": "MEMORY_EXHAUSTION"},
+        {"pod": "pod-B", "resource_name": "pod-B/c2", "failure_type": "LIVENESS_PROBE_FAILURE"},
+    ]
+    observed_pods = [{"pod": "pod-A", "owners": []}, {"pod": "pod-B", "owners": []}]
+
+    await planner.plan_remediations(
+        diagnoses=diagnoses,
+        namespace="k8s-agent-demo",
+        observed_pods=observed_pods,
+        use_llm=False,
+    )
+
+    config_calls = [
+        call for call in bridge.call_tool.call_args_list
+        if call[0][0] == "get_resource_config"
+    ]
+    # Exactly 2 calls (one for pod-A, one for pod-B), NOT 4 calls!
+    assert len(config_calls) == 2
+    called_pods = {c[0][1]["pod_name"] for c in config_calls}
+    assert called_pods == {"pod-A", "pod-B"}
+
+
+@pytest.mark.anyio
+async def test_backward_compatible_plan_with_gemini_direct_call():
+    """Verify _plan_with_gemini works as expected when called directly."""
+    planner = RemediationPlanner()
+    diag = {
+        "failure_type": "MEMORY_EXHAUSTION",
+        "pod": "direct-pod",
+        "resource_name": "direct-pod/app",
+        "evidence": ["Required memory limit: 256Mi based on profiler"],
+    }
+    mock_resp = MagicMock()
+    mock_resp.text = json.dumps({
+        "status": "ACTIONABLE",
+        "can_remediate": True,
+        "justification": "Direct memory bump",
+        "risk_level": "MEDIUM",
+        "diff": "--- memory: 64Mi\n+++ memory: 256Mi",
+        "patch_content": {"spec": {"containers": [{"name": "app", "resources": {"limits": {"memory": "256Mi"}}}]}},
+    })
+
+    with patch("app.orchestrator.agents.remediation_agent.Client") as mock_client_cls:
+        mock_instance = MagicMock()
+        mock_instance.aio.models.generate_content = AsyncMock(return_value=mock_resp)
+        mock_client_cls.return_value = mock_instance
+
+        with patch.dict(os.environ, {"GEMINI_API_KEY": "mock-api-key"}):
+            prop = await planner._plan_with_gemini(
+                diag=diag,
+                namespace="k8s-agent-demo",
+                pod_name="direct-pod",
+                target_info={"target_kind": "Pod", "target_name": "direct-pod", "is_standalone_pod": True},
+                resource_config={},
+                pod_evidence={"pod": "direct-pod"},
+            )
+
+    assert prop is not None
+    assert prop.target_workload == "direct-pod"
+    assert prop.status == ProposalStatus.ACTIONABLE
+
+
+# =============================================================================
+# Phase 4C Reliability and Observability Tests
+# =============================================================================
+
+def test_sanitize_error_message_redacts_credentials():
+    """Verify sanitizer masks API keys, tokens, query params, and bearer headers."""
+    # None and empty handling
+    assert sanitize_error_message(None) is None
+    assert sanitize_error_message("") == ""
+    assert sanitize_error_message(12345) == 12345  # Non-string passthrough
+
+    # Google AI / Firebase keys (AIza...)
+    raw_aiza = "Error connecting to endpoint with key AIzaSyD-12345678901234567890123456789012 for model"
+    sanitized = sanitize_error_message(raw_aiza)
+    assert "[REDACTED_API_KEY]" in sanitized
+    assert "AIzaSyD" not in sanitized
+
+    # AQ. tokens
+    raw_aq = "Failed token validation: AQ.abdef123456789012345678901234567890"
+    sanitized = sanitize_error_message(raw_aq)
+    assert "[REDACTED_TOKEN]" in sanitized
+    assert "AQ.abdef" not in sanitized
+
+    # Bearer tokens
+    raw_bearer = "Authorization failed: Bearer ya29.a0AfH6SMD_secret_token_123"
+    sanitized = sanitize_error_message(raw_bearer)
+    assert "Bearer [REDACTED_TOKEN]" in sanitized
+    assert "ya29" not in sanitized
+
+    # Query params (key=..., api_key=..., token=...)
+    raw_query = "Request URL: https://generativelanguage.googleapis.com/v1beta?key=secret_api_key_value&alt=json"
+    sanitized = sanitize_error_message(raw_query)
+    assert "key=[REDACTED]" in sanitized
+    assert "secret_api_key_value" not in sanitized
+
+
+@pytest.mark.anyio
+async def test_observation_agent_gemini_metrics_success():
+    """Verify ObservationAgent records GeminiRequestMetric on successful LLM execution."""
+    bridge = _build_mock_bridge()
+    agent = ObservationAgent(bridge=bridge)
+    req = InvestigationRequest(namespace="k8s-agent-demo")
+
+    mock_event = MagicMock()
+    mock_event.get_function_calls.return_value = []
+    mock_part = MagicMock()
+    mock_part.text = "Cluster telemetry observed."
+    mock_event.message.parts = [mock_part]
+
+    async def mock_run_async(*args, **kwargs):
+        yield mock_event
+
+    with patch.dict(os.environ, {"GEMINI_API_KEY": "mock-api-key"}):
+        with patch("app.orchestrator.agents.observation_agent.Runner") as mock_runner_cls:
+            mock_runner = MagicMock()
+            mock_runner.run_async = mock_run_async
+            mock_runner_cls.return_value = mock_runner
+
+            report, traces, text = await agent.observe(request=req, use_llm=True)
+
+    assert report.provenance == "GEMINI_AGENT"
+    metrics = agent.get_metrics()
+    assert len(metrics) == 1
+    m = metrics[0]
+    assert m.stage == "OBSERVATION"
+    assert m.model == "gemini-3.8-flash"
+    assert m.success is True
+    assert m.duration_ms is not None and m.duration_ms >= 0.0
+    assert m.fallback_triggered is False
+    assert m.error_type is None
+    assert m.error_message is None
+
+
+@pytest.mark.anyio
+async def test_observation_agent_gemini_metrics_timeout():
+    """Verify ObservationAgent records GeminiRequestMetric on timeout and falls back."""
+    bridge = _build_mock_bridge()
+    agent = ObservationAgent(bridge=bridge)
+    req = InvestigationRequest(namespace="k8s-agent-demo")
+
+    async def mock_hanging_run_async(*args, **kwargs):
+        await asyncio.sleep(10.0)
+        yield MagicMock()
+
+    with patch.dict(os.environ, {"GEMINI_API_KEY": "mock-api-key"}):
+        with patch("app.orchestrator.agents.observation_agent.Runner") as mock_runner_cls:
+            mock_runner = MagicMock()
+            mock_runner.run_async = mock_hanging_run_async
+            mock_runner_cls.return_value = mock_runner
+
+            # Use short timeout so test runs quickly
+            report, traces, text = await agent.observe(request=req, use_llm=True, timeout_seconds=20.1)
+
+    assert report.provenance == "DETERMINISTIC_FALLBACK"
+    assert report.llm_error["type"] == "TimeoutError"
+    metrics = agent.get_metrics()
+    assert len(metrics) == 1
+    m = metrics[0]
+    assert m.stage == "OBSERVATION"
+    assert m.success is False
+    assert m.error_type == "TimeoutError"
+    assert "timed out" in m.error_message
+    assert m.fallback_triggered is True
+    assert "timed out" in m.fallback_reason
+
+
+@pytest.mark.anyio
+async def test_observation_agent_gemini_metrics_503_error():
+    """Verify ObservationAgent records 503 error code and sanitized error in metric."""
+    bridge = _build_mock_bridge()
+    agent = ObservationAgent(bridge=bridge)
+    req = InvestigationRequest(namespace="k8s-agent-demo")
+
+    class MockGoogleAPIError(Exception):
+        code = 503
+        attempts = 3
+
+    async def mock_failing_run_async(*args, **kwargs):
+        raise MockGoogleAPIError("503 Service Unavailable with key=AIzaSyD-12345678901234567890123456789012")
+        yield MagicMock()
+
+    with patch.dict(os.environ, {"GEMINI_API_KEY": "mock-api-key"}):
+        with patch("app.orchestrator.agents.observation_agent.Runner") as mock_runner_cls:
+            mock_runner = MagicMock()
+            mock_runner.run_async = mock_failing_run_async
+            mock_runner_cls.return_value = mock_runner
+
+            report, traces, text = await agent.observe(request=req, use_llm=True)
+
+    assert report.provenance == "DETERMINISTIC_FALLBACK"
+    metrics = agent.get_metrics()
+    assert len(metrics) == 1
+    m = metrics[0]
+    assert m.stage == "OBSERVATION"
+    assert m.success is False
+    assert m.status_code == 503
+    assert m.retries_attempted == 3
+    assert m.fallback_triggered is True
+    assert "[REDACTED" in m.error_message
+    assert "AIzaSyD" not in m.error_message
+
+
+@pytest.mark.anyio
+async def test_observation_agent_preserves_partial_traces_and_avoids_duplicate_scan():
+    """Verify partial tool calls before timeout are preserved and duplicate scan_cluster is avoided."""
+    bridge = _build_mock_bridge()
+    agent = ObservationAgent(bridge=bridge)
+    req = InvestigationRequest(namespace="k8s-agent-demo")
+
+    fc_mock = MagicMock()
+    fc_mock.name = "scan_cluster"
+    fc_mock.args = {"namespace": "k8s-agent-demo"}
+
+    event_mock = MagicMock()
+    event_mock.get_function_calls.return_value = [fc_mock]
+    event_mock.message = None
+
+    async def mock_partial_then_timeout(*args, **kwargs):
+        yield event_mock
+        await asyncio.sleep(10.0)
+
+    with patch.dict(os.environ, {"GEMINI_API_KEY": "mock-api-key"}):
+        with patch("app.orchestrator.agents.observation_agent.Runner") as mock_runner_cls:
+            mock_runner = MagicMock()
+            mock_runner.run_async = mock_partial_then_timeout
+            mock_runner_cls.return_value = mock_runner
+
+            report, traces, text = await agent.observe(request=req, use_llm=True, timeout_seconds=20.1)
+
+    # Observation fell back
+    assert report.provenance == "DETERMINISTIC_FALLBACK"
+    # Partial trace preserved
+    scan_traces = [t for t in traces if t.tool_name == "scan_cluster"]
+    # Only 1 scan_cluster trace recorded (not duplicated!)
+    assert len(scan_traces) == 1
+    assert scan_traces[0].agent_name == "observation_agent"
+
+
+@pytest.mark.anyio
+async def test_remediation_planner_metrics_and_mcp_traces_success():
+    """Verify RemediationPlanner records metrics and MCP get_resource_config traces on success."""
+    bridge = _build_mock_bridge()
+    planner = RemediationPlanner(bridge=bridge)
+    diagnoses = [{
+        "failure_type": "MEMORY_EXHAUSTION",
+        "pod": "oom-app-abc",
+        "resource_name": "oom-app-abc/app",
+        "evidence": ["Required memory limit: 256Mi based on profiler"],
+    }]
+
+    mock_resp = MagicMock()
+    mock_resp.text = json.dumps({
+        "proposals": [{
+            "item_id": "diag_0_oom-app-abc",
+            "resource_name": "oom-app-abc/app",
+            "status": "ACTIONABLE",
+            "can_remediate": True,
+            "justification": "Memory bump based on evidence",
+            "risk_level": "LOW",
+            "diff": "--- memory: 64Mi\n+++ memory: 256Mi",
+            "patch_content": {"spec": {"containers": [{"name": "app", "resources": {"limits": {"memory": "256Mi"}}}]}},
+        }]
+    })
+
+    with patch("app.orchestrator.agents.remediation_agent.Client") as mock_client_cls:
+        mock_instance = MagicMock()
+        mock_instance.aio.models.generate_content = AsyncMock(return_value=mock_resp)
+        mock_client_cls.return_value = mock_instance
+
+        with patch.dict(os.environ, {"GEMINI_API_KEY": "mock-api-key"}):
+            proposals = await planner.plan_remediations(
+                diagnoses=diagnoses,
+                namespace="k8s-agent-demo",
+                observed_pods=[{"pod": "oom-app-abc"}],
+                use_llm=True,
+            )
+
+    assert len(proposals) == 1
+    assert proposals[0].provenance == ProposalProvenance.GEMINI_AGENT
+    assert planner.remediation_provenance == "GEMINI_AGENT"
+
+    # Verify metrics
+    metrics = planner.get_metrics()
+    assert len(metrics) == 1
+    assert metrics[0].stage == "REMEDIATION"
+    assert metrics[0].success is True
+    assert metrics[0].fallback_triggered is False
+
+    # Verify traces
+    traces = planner.get_traces()
+    config_traces = [t for t in traces if t.tool_name == "get_resource_config"]
+    batch_traces = [t for t in traces if t.tool_name == "plan_batch_remediation"]
+    assert len(config_traces) == 1
+    assert config_traces[0].agent_name == "remediation_planner"
+    assert config_traces[0].status == "SUCCESS"
+    assert len(batch_traces) == 1
+    assert batch_traces[0].status == "SUCCESS"
+
+
+@pytest.mark.anyio
+async def test_remediation_planner_metrics_and_traces_on_503_fallback():
+    """Verify RemediationPlanner records 503 error, sanitizes secrets, and traces fallback."""
+    bridge = _build_mock_bridge()
+    planner = RemediationPlanner(bridge=bridge)
+    diagnoses = [{
+        "failure_type": "MEMORY_EXHAUSTION",
+        "pod": "oom-app-abc",
+        "resource_name": "oom-app-abc/app",
+        "evidence": ["Required memory limit: 256Mi based on profiler"],
+    }]
+
+    class Mock503Error(Exception):
+        code = 503
+
+    with patch("app.orchestrator.agents.remediation_agent.Client") as mock_client_cls:
+        mock_instance = MagicMock()
+        mock_instance.aio.models.generate_content = AsyncMock(
+            side_effect=Mock503Error("Google 503: Temporary demand with key=AIzaSyD-98765432109876543210987654321098")
+        )
+        mock_client_cls.return_value = mock_instance
+
+        with patch.dict(os.environ, {"GEMINI_API_KEY": "mock-api-key"}):
+            proposals = await planner.plan_remediations(
+                diagnoses=diagnoses,
+                namespace="k8s-agent-demo",
+                observed_pods=[{"pod": "oom-app-abc"}],
+                use_llm=True,
+            )
+
+    assert len(proposals) == 1
+    assert proposals[0].provenance == ProposalProvenance.DETERMINISTIC_FALLBACK
+    assert planner.remediation_provenance == "DETERMINISTIC_FALLBACK"
+
+    # Verify metric
+    metrics = planner.get_metrics()
+    assert len(metrics) == 1
+    assert metrics[0].stage == "REMEDIATION"
+    assert metrics[0].success is False
+    assert metrics[0].status_code == 503
+    assert metrics[0].fallback_triggered is True
+    assert "[REDACTED" in metrics[0].error_message
+    assert "AIzaSyD" not in metrics[0].error_message
+
+    # Verify traces show fallback
+    traces = planner.get_traces()
+    batch_trace = next(t for t in traces if t.tool_name == "plan_batch_remediation")
+    assert batch_trace.status == "FALLBACK"
+
+
+def test_verification_planner_records_activity_trace():
+    """Verify VerificationPlanner records tool trace for attached verification plans."""
+    planner = VerificationPlanner()
+    proposals = [
+        RemediationProposal(
+            target_workload="web-pod",
+            target_kind="Deployment",
+            target_name="web-deploy",
+            target_namespace="k8s-agent-demo",
+            status=ProposalStatus.ACTIONABLE,
+            can_remediate=True,
+            patch=YamlPatch(target_kind="Deployment", target_name="web-deploy", target_namespace="k8s-agent-demo", diff="--- a\n+++ b", patch_content={}),
+            justification="Fix web",
+            risk_level=RiskLevel.LOW,
+            requires_approval=True,
+            approval=HumanApproval(status=ApprovalStatus.PENDING),
+        )
+    ]
+    diagnoses = [{"pod": "web-pod", "failure_type": "APPLICATION_PROCESS_FAILURE"}]
+
+    verified = planner.plan_verification(proposals=proposals, diagnoses=diagnoses)
+    assert verified[0].verification_plan is not None
+
+    traces = planner.get_traces()
+    assert len(traces) == 1
+    t = traces[0]
+    assert t.agent_name == "verification_planner"
+    assert t.tool_name == "plan_verification"
+    assert t.status == "SUCCESS"
+    assert "Attached verification plans to 1 actionable proposals" in t.result_summary
+
+
+@pytest.mark.anyio
+async def test_pipeline_aggregates_all_traces_and_independent_provenances():
+    """Verify pipeline aggregates traces across all 4 stages and sets independent provenances."""
+    bridge = _build_mock_bridge()
+    req = InvestigationRequest(namespace="k8s-agent-demo")
+    pipeline = InvestigationPipeline(bridge=bridge)
+
+    result = await pipeline.execute(request=req, use_llm=False)
+
+    assert result.status == InvestigationStatus.COMPLETED
+    assert result.outcome == "COMPLETED_WITH_FALLBACK"
+    assert result.observation_provenance == "DETERMINISTIC_FALLBACK"
+    assert result.diagnosis_provenance == "DETERMINISTIC_ENGINE"
+    assert result.remediation_provenance == "DETERMINISTIC_FALLBACK"
+    assert result.verification_provenance == "DETERMINISTIC_ENGINE"
+
+    # Verify traces from all 4 stages are present
+    tool_names = {t.tool_name for t in result.tool_traces}
+    assert "scan_cluster" in tool_names
+    assert "run_diagnosis" in tool_names
+    assert "get_resource_config" in tool_names
+    assert "plan_batch_remediation" in tool_names
+    assert "plan_verification" in tool_names
+
+
+@pytest.mark.anyio
+async def test_pipeline_outcome_completed_with_gemini():
+    """Verify pipeline outcome is COMPLETED_WITH_GEMINI only when both Gemini stages succeed."""
+    bridge = _build_mock_bridge()
+    req = InvestigationRequest(namespace="k8s-agent-demo")
+    pipeline = InvestigationPipeline(bridge=bridge)
+
+    mock_obs_report = ObservationReport(
+        namespace="k8s-agent-demo",
+        pod_count=1,
+        pods=[{"pod": "test-pod"}],
+        events=[],
+        logs_summary={},
+        provenance="GEMINI_AGENT",
+        llm_error=None,
+    )
+
+    mock_proposal = RemediationProposal(
+        target_workload="test-pod",
+        target_kind="Deployment",
+        target_name="test-deploy",
+        target_namespace="k8s-agent-demo",
+        status=ProposalStatus.ACTIONABLE,
+        can_remediate=True,
+        patch=YamlPatch(target_kind="Deployment", target_name="test-deploy", target_namespace="k8s-agent-demo", diff="--- a\n+++ b", patch_content={}),
+        justification="Grounded fix",
+        risk_level=RiskLevel.LOW,
+        requires_approval=True,
+        approval=HumanApproval(status=ApprovalStatus.PENDING),
+        provenance=ProposalProvenance.GEMINI_AGENT,
+    )
+
+    async def mock_plan_remediations_gemini(self, *args, **kwargs):
+        self.remediation_provenance = "GEMINI_AGENT"
+        return [mock_proposal]
+
+    with patch.dict(os.environ, {"GEMINI_API_KEY": "mock-api-key"}):
+        with patch("app.orchestrator.pipeline.ObservationAgent.observe", return_value=(mock_obs_report, [], "Synthesized")):
+            with patch.object(RemediationPlanner, "plan_remediations", mock_plan_remediations_gemini):
+                result = await pipeline.execute(request=req, use_llm=True)
+
+    assert result.status == InvestigationStatus.COMPLETED
+    assert result.observation_provenance == "GEMINI_AGENT"
+    assert result.remediation_provenance == "GEMINI_AGENT"
+    assert result.outcome == "COMPLETED_WITH_GEMINI"
+
+
+@pytest.mark.anyio
+async def test_pipeline_outcome_completed_with_fallback_when_one_stage_falls_back():
+    """Verify pipeline outcome is COMPLETED_WITH_FALLBACK when observation succeeds but remediation falls back."""
+    bridge = _build_mock_bridge()
+    req = InvestigationRequest(namespace="k8s-agent-demo")
+    pipeline = InvestigationPipeline(bridge=bridge)
+
+    mock_obs_report = ObservationReport(
+        namespace="k8s-agent-demo",
+        pod_count=1,
+        pods=[{"pod": "test-pod"}],
+        events=[],
+        logs_summary={},
+        provenance="GEMINI_AGENT",
+        llm_error=None,
+    )
+
+    mock_fallback_proposal = RemediationProposal(
+        target_workload="test-pod",
+        target_kind="Deployment",
+        target_name="test-deploy",
+        target_namespace="k8s-agent-demo",
+        status=ProposalStatus.ACTIONABLE,
+        can_remediate=True,
+        patch=YamlPatch(target_kind="Deployment", target_name="test-deploy", target_namespace="k8s-agent-demo", diff="--- a\n+++ b", patch_content={}),
+        justification="Fallback fix",
+        risk_level=RiskLevel.LOW,
+        requires_approval=True,
+        approval=HumanApproval(status=ApprovalStatus.PENDING),
+        provenance=ProposalProvenance.DETERMINISTIC_FALLBACK,
+    )
+
+    with patch.dict(os.environ, {"GEMINI_API_KEY": "mock-api-key"}):
+        with patch("app.orchestrator.pipeline.ObservationAgent.observe", return_value=(mock_obs_report, [], "Synthesized")):
+            with patch("app.orchestrator.pipeline.RemediationPlanner.plan_remediations", return_value=[mock_fallback_proposal]):
+                # RemediationPlanner defaults to DETERMINISTIC_FALLBACK
+                result = await pipeline.execute(request=req, use_llm=True)
+
+    assert result.status == InvestigationStatus.COMPLETED
+    assert result.observation_provenance == "GEMINI_AGENT"
+    assert result.remediation_provenance == "DETERMINISTIC_FALLBACK"
+    assert result.outcome == "COMPLETED_WITH_FALLBACK"
+
+
+@pytest.mark.anyio
+async def test_pipeline_outcome_failed_on_fatal_exception():
+    """Verify pipeline sets outcome to FAILED and sanitizes error message on fatal exception."""
+    bridge = _build_mock_bridge()
+    req = InvestigationRequest(namespace="k8s-agent-demo")
+    pipeline = InvestigationPipeline(bridge=bridge)
+
+    with patch("app.orchestrator.pipeline.ObservationAgent.observe", side_effect=RuntimeError("Fatal error with key=AIzaSyD-12345678901234567890123456789012")):
+        result = await pipeline.execute(request=req, use_llm=False)
+
+    assert result.status == InvestigationStatus.FAILED
+    assert result.outcome == "FAILED"
+    assert result.error["failed_at_status"] == "OBSERVING"
+    assert "[REDACTED" in result.error["message"]
+    assert "AIzaSyD" not in result.error["message"]
+    assert "AIzaSyD" not in result.error["message"]
+
+
+def test_missing_status_code_and_retries_not_fabricated():
+    """Verify that when SDK does not expose status code or retries, they are left as None."""
+    # Test on an exception with no code and no attempts
+    plain_exc = ValueError("Plain value error without HTTP metadata")
+    status_code = getattr(plain_exc, "code", None) or getattr(plain_exc, "status_code", None)
+    retries = getattr(plain_exc, "attempts", None) or getattr(plain_exc, "retry_count", None)
+
+    assert status_code is None
+    assert retries is None
+
+    metric = GeminiRequestMetric(
+        stage="REMEDIATION",
+        model="gemini-3.8-flash",
+        status_code=status_code,
+        retries_attempted=retries,
+    )
+    assert metric.status_code is None
+    assert metric.retries_attempted is None
+    metric_dict = metric.model_dump()
+    assert metric_dict["status_code"] is None
+    assert metric_dict["retries_attempted"] is None

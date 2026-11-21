@@ -24,3 +24,21 @@ __pycache__/
 # IDEs
 .idea/
 .vscode/
+
+# Dependencies
+node_modules/
+.venv/
+
+# Build output
+dist/
+build/
+
+# Environment variables
+.env
+.env.*
+!.env.example
+
+# Python cache
+__pycache__/
+*.py[cod]
+.pytest_cache/
