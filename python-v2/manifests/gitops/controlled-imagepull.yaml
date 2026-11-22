@@ -1,0 +1,41 @@
+# ==============================================================================
+# KafaKube8 GitOps Remediation Controlled Scenario
+# Scenario: ImagePullBackOff / ErrImagePull
+# Target Resource: apps/v1 Deployment 'gitops-controlled-app'
+# Namespace: k8s-agent-demo
+# 
+# Intentional failure: Container image reference does not exist on Docker Hub / registry
+# Configured trusted replacement: nginx:1.27.0-alpine
+# ==============================================================================
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: gitops-controlled-app
+  namespace: k8s-agent-demo
+  labels:
+    app.kubernetes.io/name: gitops-controlled-app
+    app.kubernetes.io/part-of: kafakube8-gitops-demo
+    app.kubernetes.io/managed-by: gitops
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: gitops-controlled-app
+  template:
+    metadata:
+      labels:
+        app: gitops-controlled-app
+    spec:
+      containers:
+        - name: web
+          image: nginx:invalid-tag-does-not-exist
+          ports:
+            - containerPort: 80
+              name: http
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: 200m
+              memory: 128Mi
