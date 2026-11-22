@@ -94,6 +94,7 @@ export interface YamlPatch {
 
 export interface VerificationPlan {
   target_pod_phase?: string;
+  target_phase?: string;
   expected_ready_condition?: boolean;
   readiness_probe_initial_delay_seconds?: number;
   timeout_seconds?: number;
@@ -101,7 +102,7 @@ export interface VerificationPlan {
 }
 
 export interface HumanApproval {
-  status: "PENDING_APPROVAL" | "APPROVED" | "REJECTED";
+  status: "PENDING" | "PENDING_APPROVAL" | "APPROVED" | "REJECTED";
   reviewer?: string | null;
   reviewed_at?: string | null;
   comments?: string | null;
@@ -113,16 +114,20 @@ export interface RemediationProposal {
   target_workload: string;
   target_kind: string;
   target_name: string;
+  target_namespace?: string;
   status: "ACTIONABLE" | "INSUFFICIENT_EVIDENCE" | "FAILED";
   provenance: string;
   can_remediate: boolean;
   insufficient_evidence_reason?: string | null;
-  summary: string;
+  summary?: string;
+  justification?: string;
   root_cause_explanation?: string;
   risk_level: "LOW" | "MEDIUM" | "HIGH" | "CRITICAL";
   patch?: YamlPatch | null;
   verification_plan?: VerificationPlan | null;
   approval?: HumanApproval;
+  requires_approval?: boolean;
+  created_at?: string;
 }
 
 export interface Diagnosis {

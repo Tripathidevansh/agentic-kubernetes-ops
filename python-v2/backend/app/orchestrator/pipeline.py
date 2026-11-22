@@ -27,6 +27,7 @@ from app.orchestrator.agents.diagnosis_agent import DeterministicDiagnosisAgent
 from app.orchestrator.agents.observation_agent import ObservationAgent
 from app.orchestrator.agents.remediation_agent import RemediationPlanner
 from app.orchestrator.agents.verification_agent import VerificationPlanner
+from app.orchestrator.enrichment import enrich_proposals_with_trusted_targets
 from app.orchestrator.sanitizer import sanitize_error_message
 from app.validators.safety_validator import validate_read_only_tools
 
@@ -157,6 +158,14 @@ class InvestigationPipeline:
                     timeout=self.stage_timeout,
                 )
                 all_traces.extend(rem_planner.get_traces())
+
+                # Deterministic trusted-target enrichment (Phase 7B.1)
+                proposals = enrich_proposals_with_trusted_targets(
+                    proposals=proposals,
+                    diagnoses=diagnoses,
+                    namespace=request.namespace,
+                    observed_pods=obs_report.pods if obs_report else [],
+                )
 
                 # -------------------------------------------------------------
                 # Stage 4: Verification Planning

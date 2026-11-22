@@ -362,6 +362,10 @@ def validate_remediation_proposal(
 
     # 3. Actionability & Insufficient Evidence handling
     if proposal.can_remediate:
+        if proposal.status != ProposalStatus.ACTIONABLE:
+            raise SafetyViolationError(
+                f"Contradictory proposal: can_remediate is True but status is '{proposal.status.value}'."
+            )
         if not proposal.patch or not proposal.patch.diff:
             raise SafetyViolationError("Actionable proposal must contain a non-empty YAML patch diff.")
 
@@ -383,6 +387,10 @@ def validate_remediation_proposal(
 
     else:
         # Non-actionable / INSUFFICIENT_EVIDENCE proposal
+        if proposal.status == ProposalStatus.ACTIONABLE:
+            raise SafetyViolationError(
+                "Contradictory proposal: can_remediate is False but status is ACTIONABLE."
+            )
         if proposal.patch is not None:
             raise SafetyViolationError(
                 "Safety guardrail violation: Proposal with can_remediate=False must not contain a YAML patch."

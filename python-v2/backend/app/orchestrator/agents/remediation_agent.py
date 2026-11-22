@@ -595,6 +595,16 @@ Respond in strict JSON with schema:
                     iid = batch_items[idx]["item_id"]
                     item["item_id"] = iid
 
+            # Pass through fail-closed BatchProposalItem schema
+            try:
+                item = BatchProposalItem.model_validate(item).model_dump()
+            except Exception as val_err:
+                logger.warning("Malformed batch item at index %d discarded: %s", idx, val_err)
+                continue
+
+            iid = item.get("item_id")
+            rname = item.get("resource_name")
+
             if iid:
                 if iid in seen_ids:
                     prev = proposals_by_id.get(iid)
@@ -633,45 +643,117 @@ Respond in strict JSON with schema:
         pod_evidence: Optional[Dict[str, Any]],
     ) -> RemediationProposal:
         """Construct a validated RemediationProposal from parsed LLM proposal data."""
-        status_str = str(item_data.get("status", "ACTIONABLE")).upper()
-        can_rem = bool(item_data.get("can_remediate", True))
+        # 1. Actionability and status - strict explicit check (fail-closed)
+        raw_can_rem = item_data.get("can_remediate")
+        is_explicit_can_rem = (raw_can_rem is True)
 
-        if status_str == "INSUFFICIENT_EVIDENCE" or not can_rem:
+        raw_status = item_data.get("status")
+        is_explicit_actionable = (
+            isinstance(raw_status, str)
+            and raw_status.strip().upper() == "ACTIONABLE"
+        )
+
+        # 2. Diff and patch content check
+        raw_diff = item_data.get("diff")
+        has_valid_diff = (
+            isinstance(raw_diff, str)
+            and bool(raw_diff.strip())
+        )
+        diff_str = raw_diff.strip() if has_valid_diff else ""
+
+        raw_patch_content = item_data.get("patch_content")
+        has_valid_patch_content = (
+            isinstance(raw_patch_content, dict)
+            and len(raw_patch_content) > 0
+        )
+        patch_content_dict = raw_patch_content if has_valid_patch_content else {}
+
+        # 3. Target resource check
+        target_kind = str(target_info.get("target_kind") or "").strip()
+        target_name = str(target_info.get("target_name") or "").strip()
+        has_valid_target = bool(target_kind and target_name)
+
+        # 4. Check for fail-closed demotion reasons
+        demotion_reasons = []
+        if not is_explicit_can_rem:
+            if raw_can_rem is None:
+                demotion_reasons.append("can_remediate omitted or null in LLM response")
+            else:
+                demotion_reasons.append("can_remediate is False in LLM response")
+        if not is_explicit_actionable:
+            if raw_status is None:
+                demotion_reasons.append("status omitted or null in LLM response")
+            else:
+                demotion_reasons.append(f"status '{raw_status}' is not ACTIONABLE")
+        if is_explicit_can_rem and not has_valid_diff:
+            demotion_reasons.append("manifest diff is empty or missing from LLM response")
+        if is_explicit_can_rem and not has_valid_patch_content:
+            demotion_reasons.append("patch payload is empty or missing from LLM response")
+        if is_explicit_can_rem and not has_valid_target:
+            demotion_reasons.append("target resource is invalid or missing")
+
+        # Determine overall actionability
+        is_actionable = (
+            is_explicit_can_rem
+            and is_explicit_actionable
+            and has_valid_diff
+            and has_valid_patch_content
+            and has_valid_target
+        )
+
+        # Extract risk level - fail-closed default to HIGH
+        raw_risk = item_data.get("risk_level")
+        if isinstance(raw_risk, str) and raw_risk.strip().upper() in RiskLevel.__members__:
+            risk_level = RiskLevel[raw_risk.strip().upper()]
+        else:
+            risk_level = RiskLevel.HIGH
+
+        # Justification check
+        raw_justification = item_data.get("justification")
+        justification_str: Optional[str] = None
+        if isinstance(raw_justification, str) and raw_justification.strip():
+            justification_str = raw_justification.strip()
+
+        if not is_actionable:
+            explicit_reason = item_data.get("insufficient_evidence_reason")
+            if explicit_reason and str(explicit_reason).strip():
+                insufficient_reason = str(explicit_reason).strip()
+            elif demotion_reasons:
+                insufficient_reason = f"Remediation withheld: {'; '.join(demotion_reasons)}."
+            elif diag.get("root_cause"):
+                insufficient_reason = f"Remediation withheld: {diag['root_cause']}."
+            else:
+                insufficient_reason = "Remediation withheld due to insufficient supporting evidence."
+
+            if not justification_str:
+                justification_str = f"Remediation withheld: {insufficient_reason}"
+
             return RemediationProposal(
                 target_workload=pod_name,
-                target_kind=target_info["target_kind"],
-                target_name=target_info["target_name"],
+                target_kind=target_kind or "Pod",
+                target_name=target_name or pod_name,
                 target_namespace=namespace,
                 status=ProposalStatus.INSUFFICIENT_EVIDENCE,
                 can_remediate=False,
-                insufficient_evidence_reason=item_data.get(
-                    "insufficient_evidence_reason",
-                    "Remediation withheld due to insufficient supporting evidence."
-                ),
+                insufficient_evidence_reason=insufficient_reason,
                 patch=None,
-                justification=item_data.get(
-                    "justification",
-                    "Remediation withheld: manual operator intervention required."
-                ),
-                risk_level=RiskLevel.MEDIUM,
+                justification=justification_str,
+                risk_level=risk_level,
                 requires_approval=True,
                 approval=HumanApproval(status=ApprovalStatus.PENDING),
                 provenance=ProposalProvenance.GEMINI_AGENT,
                 model_metadata={"model": self.model_name, "provider": "google_genai"},
             )
 
-        diff = item_data.get("diff", "")
-        patch_content = item_data.get("patch_content", {})
-
         # Strict check against placeholder/masking commands from LLM
         try:
-            validate_no_masking_commands(diff, patch_content)
+            validate_no_masking_commands(diff_str, patch_content_dict)
         except SafetyViolationError as exc:
             logger.warning("Gemini proposed an unsafe masking command: %s. Rejecting proposal.", exc)
             return RemediationProposal(
                 target_workload=pod_name,
-                target_kind=target_info["target_kind"],
-                target_name=target_info["target_name"],
+                target_kind=target_kind,
+                target_name=target_name,
                 target_namespace=namespace,
                 status=ProposalStatus.REJECTED_SAFETY_VIOLATION,
                 can_remediate=False,
@@ -685,16 +767,24 @@ Respond in strict JSON with schema:
                 model_metadata={"model": self.model_name, "provider": "google_genai"},
             )
 
-        risk_str = str(item_data.get("risk_level", "MEDIUM")).upper()
-        risk_level = RiskLevel[risk_str] if risk_str in RiskLevel.__members__ else RiskLevel.MEDIUM
-
         yaml_patch = YamlPatch(
-            target_kind=target_info["target_kind"],
-            target_name=target_info["target_name"],
+            target_kind=target_kind,
+            target_name=target_name,
             target_namespace=namespace,
-            diff=diff,
-            patch_content=patch_content if isinstance(patch_content, dict) else {},
+            diff=diff_str,
+            patch_content=patch_content_dict,
         )
+
+        # Build actionable justification grounded in diagnosis if not provided or empty
+        if not justification_str:
+            rec_action = diag.get("recommended_action")
+            if isinstance(rec_action, str) and rec_action.strip():
+                justification_str = rec_action.strip()
+            else:
+                justification_str = (
+                    f"Automated remediation proposal for {target_kind} '{target_name}' "
+                    f"to address {diag.get('failure_type', 'detected failure')}."
+                )
 
         # Strict check against ungrounded resource sizing from LLM
         try:
@@ -739,7 +829,7 @@ Respond in strict JSON with schema:
             status=ProposalStatus.ACTIONABLE,
             can_remediate=True,
             patch=yaml_patch,
-            justification=item_data.get("justification", diag.get("recommended_action", "Remediation recommended")),
+            justification=justification_str,
             risk_level=risk_level,
             requires_approval=True,
             approval=HumanApproval(status=ApprovalStatus.PENDING),

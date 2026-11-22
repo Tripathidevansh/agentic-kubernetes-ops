@@ -89,14 +89,18 @@ class ApiService {
     investigationId?: string,
     status?: string,
     approvalStatus?: string
-  ): Promise<{ total: number; remediations: RemediationProposal[] }> {
+  ): Promise<RemediationProposal[]> {
     const params = new URLSearchParams();
     if (investigationId) params.append('investigation_id', investigationId);
     if (status) params.append('status', status);
     if (approvalStatus) params.append('approval_status', approvalStatus);
 
     const query = params.toString() ? `?${params.toString()}` : '';
-    return this.request<{ total: number; remediations: RemediationProposal[] }>(`/api/remediations${query}`);
+    const res = await this.request<any>(`/api/remediations${query}`);
+    if (Array.isArray(res)) {
+      return res;
+    }
+    return res?.remediations || [];
   }
 
   async approveRemediation(

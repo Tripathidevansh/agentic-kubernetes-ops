@@ -364,9 +364,9 @@ export const InvestigationView: React.FC<InvestigationViewProps> = ({
       {/* 5-KPI METRIC STRIP (From Stitch 2 Sub 4) */}
       <div className="grid grid-cols-2 md:grid-cols-5 gap-space-sm">
         <div className="bg-surface-container-low p-space-sm rounded border border-surface-container-high">
-          <span className="text-[11px] font-mono text-outline block">Total Pods Scanned</span>
+          <span className="text-[11px] font-mono text-outline block">Total Workloads Scanned</span>
           <span className="text-lg font-bold font-mono text-on-surface">
-            {diagnoses.length > 0 ? '10' : '0'}
+            {diagnoses.length > 0 ? diagnoses.length : (proposals.length > 0 ? proposals.length : 0)}
           </span>
           <span className="text-[10px] font-mono text-on-surface-variant block">in namespace</span>
         </div>
@@ -378,16 +378,16 @@ export const InvestigationView: React.FC<InvestigationViewProps> = ({
           <span className="text-[10px] font-mono text-on-surface-variant block">Root Cause Confirmed</span>
         </div>
         <div className="bg-surface-container-low p-space-sm rounded border border-surface-container-high">
-          <span className="text-[11px] font-mono text-outline block">Remediation Proposals</span>
+          <span className="text-[11px] font-mono text-outline block">Actionable Proposals</span>
           <span className="text-lg font-bold font-mono text-tertiary">
-            {proposals.length}
+            {proposals.filter((p) => p.can_remediate && p.status === 'ACTIONABLE').length}
           </span>
-          <span className="text-[10px] font-mono text-on-surface-variant block">Actionable Proposals</span>
+          <span className="text-[10px] font-mono text-on-surface-variant block">Ready for Approval</span>
         </div>
         <div className="bg-surface-container-low p-space-sm rounded border border-surface-container-high">
           <span className="text-[11px] font-mono text-outline block">Insufficient Evidence</span>
           <span className="text-lg font-bold font-mono text-on-surface">
-            {proposals.filter((p) => !p.can_remediate).length}
+            {proposals.filter((p) => !p.can_remediate || p.status === 'INSUFFICIENT_EVIDENCE').length}
           </span>
           <span className="text-[10px] font-mono text-on-surface-variant block">No Hallucinations</span>
         </div>

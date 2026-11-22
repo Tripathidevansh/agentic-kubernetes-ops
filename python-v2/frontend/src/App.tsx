@@ -70,7 +70,8 @@ export const App: React.FC = () => {
         }
       }
       if (rems.status === 'fulfilled') {
-        setAllProposals(rems.value.remediations || []);
+        const list = Array.isArray(rems.value) ? rems.value : ((rems.value as any)?.remediations || []);
+        setAllProposals(list);
       }
 
       setLastUpdated(0);
@@ -164,7 +165,8 @@ export const App: React.FC = () => {
         setCurrentInvestigation(inv);
       }
       const rems = await api.listRemediations();
-      setAllProposals(rems.remediations || []);
+      const list = Array.isArray(rems) ? rems : ((rems as any)?.remediations || []);
+      setAllProposals(list);
     } catch (err) {
       alert(`Approval failed: ${err instanceof Error ? err.message : String(err)}`);
     } finally {
@@ -184,7 +186,8 @@ export const App: React.FC = () => {
         setCurrentInvestigation(inv);
       }
       const rems = await api.listRemediations();
-      setAllProposals(rems.remediations || []);
+      const list = Array.isArray(rems) ? rems : ((rems as any)?.remediations || []);
+      setAllProposals(list);
     } catch (err) {
       alert(`Rejection failed: ${err instanceof Error ? err.message : String(err)}`);
     } finally {
@@ -203,7 +206,7 @@ export const App: React.FC = () => {
         activeTab={activeTab}
         onSelectTab={setActiveTab}
         incidentCount={incidents.length}
-        remediationCount={allProposals.filter((p) => p.can_remediate && !p.approval).length}
+        remediationCount={allProposals.filter((p) => p.can_remediate && (p.approval?.status === 'PENDING' || !p.approval)).length}
         clusterConnected={health?.kubernetes_connected ?? true}
       />
 

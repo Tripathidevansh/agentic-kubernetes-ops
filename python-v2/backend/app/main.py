@@ -21,6 +21,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
 from app.api.cluster import router as cluster_router
+from app.api.gitops import router as gitops_router
 from app.api.health import router as health_router
 from app.api.incidents import router as incidents_router
 from app.api.investigations import router as investigations_router
@@ -139,6 +140,7 @@ app.include_router(health_router)
 
 # Core API routes under /api prefix
 app.include_router(cluster_router, prefix="/api")
+app.include_router(gitops_router, prefix="/api")
 app.include_router(incidents_router, prefix="/api")
 app.include_router(investigations_router, prefix="/api")
 app.include_router(remediations_router, prefix="/api")

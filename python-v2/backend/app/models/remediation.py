@@ -52,6 +52,16 @@ class YamlPatch(BaseModel):
         description="Structured dictionary representation of the patch"
     )
 
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_patch_data(cls, data: Any) -> Any:
+        if isinstance(data, dict):
+            data = dict(data)
+            if data.get("patch_content") is None:
+                data["patch_content"] = {}
+            return data
+        return data
+
     @field_validator("target_kind", "target_name", "diff")
     @classmethod
     def validate_non_empty(cls, v: str, info) -> str:
@@ -90,15 +100,15 @@ class RemediationProposal(BaseModel):
     target_kind: str = Field(default="Pod", description="Resource kind (Deployment, Pod, StatefulSet, etc.)")
     target_name: str = Field(default="", description="Name of the target resource to patch")
     target_namespace: str = Field(default="k8s-agent-demo", description="Target namespace")
-    status: ProposalStatus = Field(default=ProposalStatus.ACTIONABLE, description="Actionability status")
-    can_remediate: bool = Field(default=True, description="Whether a safe, valid patch could be generated")
+    status: ProposalStatus = Field(default=ProposalStatus.INSUFFICIENT_EVIDENCE, description="Actionability status")
+    can_remediate: bool = Field(default=False, description="Whether a safe, valid patch could be generated")
     insufficient_evidence_reason: Optional[str] = Field(
         default=None,
         description="Detailed explanation if remediation cannot safely be proposed"
     )
     patch: Optional[YamlPatch] = Field(default=None, description="Declarative patch details and unified diff")
     justification: str = Field(..., description="Technical explanation and root cause alignment")
-    risk_level: RiskLevel = Field(default=RiskLevel.MEDIUM, description="Risk level assessment")
+    risk_level: RiskLevel = Field(default=RiskLevel.HIGH, description="Risk level assessment")
     requires_approval: bool = Field(
         default=True,
         description="Strict safety guardrail: must be True for production deployments"
@@ -121,6 +131,106 @@ class RemediationProposal(BaseModel):
     )
     created_at: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
 
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_proposal_data(cls, data: Any) -> Any:
+        if not isinstance(data, dict):
+            return data
+        data = dict(data)
+
+        # Normalize proposal_id and created_at if explicitly passed as None
+        if data.get("proposal_id") is None:
+            data.pop("proposal_id", None)
+        if data.get("created_at") is None:
+            data.pop("created_at", None)
+
+        raw_can_rem = data.get("can_remediate")
+        raw_status = data.get("status")
+        patch_val = data.get("patch")
+
+        # Fail-closed rules:
+        # If can_remediate is explicitly None or False, it is False
+        if raw_can_rem is False or (raw_can_rem is None and "can_remediate" in data):
+            can_rem = False
+        elif raw_can_rem is True:
+            can_rem = True
+        else:
+            # can_remediate was omitted: actionable only if patch is provided
+            can_rem = bool(patch_val)
+
+        # If status is explicitly None, it defaults to INSUFFICIENT_EVIDENCE
+        if raw_status is None and "status" in data:
+            status_val = ProposalStatus.INSUFFICIENT_EVIDENCE
+        elif raw_status is not None:
+            status_str = raw_status.value if isinstance(raw_status, ProposalStatus) else str(raw_status).upper()
+            if status_str in ("ACTIONABLE", "INSUFFICIENT_EVIDENCE", "REJECTED_SAFETY_VIOLATION"):
+                status_val = ProposalStatus[status_str]
+            else:
+                status_val = ProposalStatus.INSUFFICIENT_EVIDENCE
+        else:
+            # status was omitted: ACTIONABLE if can_rem else INSUFFICIENT_EVIDENCE
+            status_val = ProposalStatus.ACTIONABLE if can_rem else ProposalStatus.INSUFFICIENT_EVIDENCE
+
+        # Cross-field consistency:
+        if not can_rem and status_val == ProposalStatus.ACTIONABLE:
+            status_val = ProposalStatus.INSUFFICIENT_EVIDENCE
+        if can_rem and status_val != ProposalStatus.ACTIONABLE:
+            can_rem = False
+            status_val = ProposalStatus.INSUFFICIENT_EVIDENCE
+
+        # If can_rem is True, patch must be provided
+        if can_rem and not patch_val:
+            can_rem = False
+            status_val = ProposalStatus.INSUFFICIENT_EVIDENCE
+
+        # If not can_rem, patch must be None
+        if not can_rem:
+            data["patch"] = None
+
+        data["can_remediate"] = can_rem
+        data["status"] = status_val
+
+        status_str = status_val.value
+
+        if "justification" not in data or data["justification"] is None:
+            target_kind = data.get("target_kind") or "Pod"
+            target_res = data.get("target_name") or data.get("target_workload") or "workload"
+            if not can_rem or status_str in ("INSUFFICIENT_EVIDENCE", "REJECTED_SAFETY_VIOLATION"):
+                reason = data.get("insufficient_evidence_reason")
+                if reason and str(reason).strip():
+                    data["justification"] = f"Remediation withheld: {str(reason).strip()}"
+                else:
+                    data["justification"] = (
+                        "Remediation withheld: manual operator intervention required due to insufficient supporting evidence."
+                    )
+            else:
+                data["justification"] = (
+                    f"Automated remediation proposal for {target_kind} '{target_res}' based on collected cluster evidence."
+                )
+
+        # Cross-normalize target_workload and target_name if one is missing
+        workload = data.get("target_workload")
+        t_name = data.get("target_name")
+        if (workload is None or not str(workload).strip()) and t_name and str(t_name).strip():
+            data["target_workload"] = str(t_name).strip()
+        if (t_name is None or not str(t_name).strip()) and workload and str(workload).strip():
+            data["target_name"] = str(workload).strip()
+
+        # Risk level fail-closed default: HIGH if None or omitted
+        if data.get("risk_level") is None:
+            data["risk_level"] = RiskLevel.HIGH
+
+        if data.get("requires_approval") is None:
+            data["requires_approval"] = True
+
+        if data.get("approval") is None:
+            data["approval"] = HumanApproval(status=ApprovalStatus.PENDING)
+
+        if data.get("provenance") is None:
+            data["provenance"] = ProposalProvenance.DETERMINISTIC_FALLBACK
+
+        return data
+
     @field_validator("target_workload", "justification")
     @classmethod
     def validate_non_empty_strings(cls, v: str, info) -> str:
@@ -136,9 +246,13 @@ class RemediationProposal(BaseModel):
         if self.can_remediate:
             if not self.patch:
                 raise ValueError("RemediationProposal with can_remediate=True must include a valid patch.")
+            if self.status != ProposalStatus.ACTIONABLE:
+                raise ValueError(f"RemediationProposal with can_remediate=True cannot have status '{self.status}'.")
         else:
             if self.status == ProposalStatus.ACTIONABLE:
                 self.status = ProposalStatus.INSUFFICIENT_EVIDENCE
+            if self.patch is not None:
+                self.patch = None
             if not self.insufficient_evidence_reason:
                 self.insufficient_evidence_reason = (
                     "Remediation cannot safely be proposed due to insufficient evidence or risk of masking failure."
@@ -150,19 +264,76 @@ class BatchProposalItem(BaseModel):
     """Structured proposal item within a batch remediation response from Gemini."""
     item_id: str = Field(..., description="Unique diagnosis identifier matching input item_id")
     resource_name: Optional[str] = Field(default=None, description="Affected resource name (e.g. pod-name/container)")
-    status: str = Field(default="ACTIONABLE", description="ACTIONABLE or INSUFFICIENT_EVIDENCE")
-    can_remediate: bool = Field(default=True, description="Whether a safe, valid patch could be generated")
+    status: str = Field(default="INSUFFICIENT_EVIDENCE", description="ACTIONABLE or INSUFFICIENT_EVIDENCE")
+    can_remediate: bool = Field(default=False, description="Whether a safe, valid patch could be generated")
     insufficient_evidence_reason: Optional[str] = Field(
         default=None,
         description="Detailed explanation if remediation cannot safely be proposed"
     )
     justification: str = Field(default="", description="Technical explanation and root cause alignment")
-    risk_level: str = Field(default="MEDIUM", description="Risk classification: LOW, MEDIUM, HIGH")
+    risk_level: str = Field(default="HIGH", description="Risk classification: LOW, MEDIUM, HIGH")
     diff: Optional[str] = Field(default=None, description="Unified diff or declarative delta showing proposed change")
     patch_content: Optional[Dict[str, Any]] = Field(
         default=None,
         description="Structured dictionary representation of the patch"
     )
+
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_batch_item_data(cls, data: Any) -> Any:
+        if isinstance(data, dict):
+            data = dict(data)
+            if data.get("justification") is None:
+                data["justification"] = ""
+
+            # Fail-closed: can_remediate must be explicitly boolean True
+            raw_can_rem = data.get("can_remediate")
+            data["can_remediate"] = (raw_can_rem is True)
+
+            # Fail-closed: status must be explicitly "ACTIONABLE"
+            raw_status = data.get("status")
+            if isinstance(raw_status, str) and raw_status.strip().upper() == "ACTIONABLE":
+                data["status"] = "ACTIONABLE"
+            else:
+                data["status"] = "INSUFFICIENT_EVIDENCE"
+
+            # Cross-field consistency: both can_remediate=True AND status=ACTIONABLE required
+            if not data["can_remediate"] or data["status"] != "ACTIONABLE":
+                data["can_remediate"] = False
+                data["status"] = "INSUFFICIENT_EVIDENCE"
+
+            # Actionable proposal MUST have non-empty diff and non-empty patch_content
+            patch_content = data.get("patch_content")
+            if patch_content is not None and not isinstance(patch_content, dict):
+                data["patch_content"] = None
+                patch_content = None
+
+            if data["can_remediate"]:
+                diff = data.get("diff")
+                if not diff or not str(diff).strip():
+                    data["can_remediate"] = False
+                    data["status"] = "INSUFFICIENT_EVIDENCE"
+                    if not data.get("insufficient_evidence_reason"):
+                        data["insufficient_evidence_reason"] = (
+                            "Remediation withheld: manifest diff is empty or missing from response."
+                        )
+                elif not patch_content or not isinstance(patch_content, dict) or len(patch_content) == 0:
+                    data["can_remediate"] = False
+                    data["status"] = "INSUFFICIENT_EVIDENCE"
+                    if not data.get("insufficient_evidence_reason"):
+                        data["insufficient_evidence_reason"] = (
+                            "Remediation withheld: patch payload is empty or missing from response."
+                        )
+
+            # Risk level: fail-closed to HIGH if missing or unknown
+            raw_risk = data.get("risk_level")
+            if isinstance(raw_risk, str) and raw_risk.strip().upper() in ("LOW", "MEDIUM", "HIGH"):
+                data["risk_level"] = raw_risk.strip().upper()
+            else:
+                data["risk_level"] = "HIGH"
+
+            return data
+        return data
 
 
 class BatchRemediationResponse(BaseModel):

@@ -970,7 +970,7 @@ async def test_gemini_observation_succeeds_normally():
         event.message.parts = [part]
         yield event
 
-    with patch.dict(os.environ, {"GEMINI_API_KEY": "mock-api-key"}):
+    with patch.dict(os.environ, {"GEMINI_API_KEY": "mock-api-key", "GEMINI_MODEL": "gemini-3.8-flash"}):
         with patch("app.orchestrator.agents.observation_agent.Runner.run_async", side_effect=mock_run_async):
             obs_report, traces, synth = await agent.observe(request=req, use_llm=True)
 
@@ -1005,7 +1005,7 @@ async def test_gemini_transient_failure_then_succeeds():
         event.message.parts = [part]
         yield event
 
-    with patch.dict(os.environ, {"GEMINI_API_KEY": "mock-api-key"}):
+    with patch.dict(os.environ, {"GEMINI_API_KEY": "mock-api-key", "GEMINI_MODEL": "gemini-3.8-flash"}):
         with patch("app.orchestrator.agents.observation_agent.Runner.run_async", side_effect=mock_run_async):
             obs_report, traces, synth = await agent.observe(request=req, use_llm=True)
 
@@ -1025,7 +1025,7 @@ async def test_gemini_exhausts_retries_and_deterministic_fallback_succeeds():
         raise RuntimeError("503 The model is overloaded. Please try again later.")
         yield
 
-    with patch.dict(os.environ, {"GEMINI_API_KEY": "mock-api-key"}):
+    with patch.dict(os.environ, {"GEMINI_API_KEY": "mock-api-key", "GEMINI_MODEL": "gemini-3.8-flash"}):
         with patch("app.orchestrator.agents.observation_agent.Runner.run_async", side_effect=mock_run_async_fail):
             obs_report, traces, synth = await agent.observe(request=req, use_llm=True)
 
@@ -1063,7 +1063,7 @@ async def test_gemini_timeout_triggers_deterministic_fallback():
             raise asyncio.TimeoutError("LLM call timed out")
         return await real_wait_for(coro, timeout=timeout)
 
-    with patch.dict(os.environ, {"GEMINI_API_KEY": "mock-api-key"}):
+    with patch.dict(os.environ, {"GEMINI_API_KEY": "mock-api-key", "GEMINI_MODEL": "gemini-3.8-flash"}):
         with patch.object(agent, "get_adk_agent", AsyncMock()):
             with patch("asyncio.wait_for", side_effect=mock_wait_for):
                 obs_report, traces, synth = await agent.observe(request=req, use_llm=True, timeout_seconds=30.0)
@@ -1140,7 +1140,7 @@ async def test_provenance_correctly_assigned_on_fallback_vs_gemini():
     req = InvestigationRequest(namespace="k8s-agent-demo")
 
     # Case A: use_llm=False -> DETERMINISTIC_FALLBACK with deterministic_rules
-    pipeline = InvestigationPipeline(bridge=bridge)
+    pipeline = InvestigationPipeline(bridge=bridge, model_name="gemini-3.8-flash")
     res_det = await pipeline.execute(request=req, use_llm=False)
     assert res_det.provenance == "DETERMINISTIC_FALLBACK"
     assert res_det.model_metadata["provider"] == "deterministic_rules"
@@ -1156,7 +1156,7 @@ async def test_provenance_correctly_assigned_on_fallback_vs_gemini():
         provenance="DETERMINISTIC_FALLBACK",
         llm_error={"type": "HttpError", "message": "503 Service Unavailable"},
     )
-    with patch.dict(os.environ, {"GEMINI_API_KEY": "mock-api-key"}):
+    with patch.dict(os.environ, {"GEMINI_API_KEY": "mock-api-key", "GEMINI_MODEL": "gemini-3.8-flash"}):
         with patch("app.orchestrator.pipeline.ObservationAgent.observe", return_value=(mock_obs_report, [], None)):
             res_fallback = await pipeline.execute(request=req, use_llm=True)
             assert res_fallback.provenance == "DETERMINISTIC_FALLBACK"
@@ -1173,7 +1173,7 @@ async def test_provenance_correctly_assigned_on_fallback_vs_gemini():
         provenance="GEMINI_AGENT",
         llm_error=None,
     )
-    with patch.dict(os.environ, {"GEMINI_API_KEY": "mock-api-key"}):
+    with patch.dict(os.environ, {"GEMINI_API_KEY": "mock-api-key", "GEMINI_MODEL": "gemini-3.8-flash"}):
         with patch("app.orchestrator.pipeline.ObservationAgent.observe", return_value=(mock_obs_report_gemini, [], "Synthesized")):
             res_gemini = await pipeline.execute(request=req, use_llm=True)
             assert res_gemini.provenance == "GEMINI_AGENT"
@@ -1239,7 +1239,7 @@ async def test_batch_remediation_ten_diagnoses_single_gemini_call():
         mock_instance.aio.models.generate_content = AsyncMock(return_value=mock_resp)
         mock_client_cls.return_value = mock_instance
 
-        with patch.dict(os.environ, {"GEMINI_API_KEY": "mock-api-key"}):
+        with patch.dict(os.environ, {"GEMINI_API_KEY": "mock-api-key", "GEMINI_MODEL": "gemini-3.8-flash"}):
             proposals = await planner.plan_remediations(
                 diagnoses=diagnoses,
                 namespace="k8s-agent-demo",
@@ -1286,7 +1286,7 @@ async def test_batch_remediation_single_diagnosis():
         mock_instance.aio.models.generate_content = AsyncMock(return_value=mock_resp)
         mock_client_cls.return_value = mock_instance
 
-        with patch.dict(os.environ, {"GEMINI_API_KEY": "mock-api-key"}):
+        with patch.dict(os.environ, {"GEMINI_API_KEY": "mock-api-key", "GEMINI_MODEL": "gemini-3.8-flash"}):
             proposals = await planner.plan_remediations(
                 diagnoses=[diag],
                 namespace="k8s-agent-demo",
@@ -1337,7 +1337,7 @@ async def test_batch_remediation_correct_mapping_of_proposals_to_diagnoses():
         mock_instance.aio.models.generate_content = AsyncMock(return_value=mock_resp)
         mock_client_cls.return_value = mock_instance
 
-        with patch.dict(os.environ, {"GEMINI_API_KEY": "mock-api-key"}):
+        with patch.dict(os.environ, {"GEMINI_API_KEY": "mock-api-key", "GEMINI_MODEL": "gemini-3.8-flash"}):
             proposals = await planner.plan_remediations(
                 diagnoses=[diag1, diag2],
                 namespace="k8s-agent-demo",
@@ -1392,7 +1392,7 @@ async def test_batch_remediation_missing_proposal_handled_by_safe_fallback():
         mock_instance.aio.models.generate_content = AsyncMock(return_value=mock_resp)
         mock_client_cls.return_value = mock_instance
 
-        with patch.dict(os.environ, {"GEMINI_API_KEY": "mock-api-key"}):
+        with patch.dict(os.environ, {"GEMINI_API_KEY": "mock-api-key", "GEMINI_MODEL": "gemini-3.8-flash"}):
             proposals = await planner.plan_remediations(
                 diagnoses=[diag1, diag2, diag3],
                 namespace="k8s-agent-demo",
@@ -1433,7 +1433,7 @@ async def test_batch_remediation_duplicate_and_malformed_proposals():
         mock_instance.aio.models.generate_content = AsyncMock(return_value=mock_resp)
         mock_client_cls.return_value = mock_instance
 
-        with patch.dict(os.environ, {"GEMINI_API_KEY": "mock-api-key"}):
+        with patch.dict(os.environ, {"GEMINI_API_KEY": "mock-api-key", "GEMINI_MODEL": "gemini-3.8-flash"}):
             proposals = await planner.plan_remediations(
                 diagnoses=[diag],
                 namespace="k8s-agent-demo",
@@ -1482,7 +1482,7 @@ async def test_batch_remediation_safety_rejection_of_one_does_not_corrupt_others
         mock_instance.aio.models.generate_content = AsyncMock(return_value=mock_resp)
         mock_client_cls.return_value = mock_instance
 
-        with patch.dict(os.environ, {"GEMINI_API_KEY": "mock-api-key"}):
+        with patch.dict(os.environ, {"GEMINI_API_KEY": "mock-api-key", "GEMINI_MODEL": "gemini-3.8-flash"}):
             proposals = await planner.plan_remediations(
                 diagnoses=[diag1, diag2],
                 namespace="k8s-agent-demo",
@@ -1517,7 +1517,7 @@ async def test_batch_remediation_gemini_api_failure_deterministic_fallback():
         mock_instance.aio.models.generate_content = AsyncMock(side_effect=RuntimeError("503 Service Unavailable"))
         mock_client_cls.return_value = mock_instance
 
-        with patch.dict(os.environ, {"GEMINI_API_KEY": "mock-api-key"}):
+        with patch.dict(os.environ, {"GEMINI_API_KEY": "mock-api-key", "GEMINI_MODEL": "gemini-3.8-flash"}):
             proposals = await planner.plan_remediations(
                 diagnoses=[diag],
                 namespace="k8s-agent-demo",
@@ -1588,7 +1588,7 @@ async def test_backward_compatible_plan_with_gemini_direct_call():
         mock_instance.aio.models.generate_content = AsyncMock(return_value=mock_resp)
         mock_client_cls.return_value = mock_instance
 
-        with patch.dict(os.environ, {"GEMINI_API_KEY": "mock-api-key"}):
+        with patch.dict(os.environ, {"GEMINI_API_KEY": "mock-api-key", "GEMINI_MODEL": "gemini-3.8-flash"}):
             prop = await planner._plan_with_gemini(
                 diag=diag,
                 namespace="k8s-agent-demo",
@@ -1643,7 +1643,7 @@ def test_sanitize_error_message_redacts_credentials():
 async def test_observation_agent_gemini_metrics_success():
     """Verify ObservationAgent records GeminiRequestMetric on successful LLM execution."""
     bridge = _build_mock_bridge()
-    agent = ObservationAgent(bridge=bridge)
+    agent = ObservationAgent(bridge=bridge, model_name="gemini-3.8-flash")
     req = InvestigationRequest(namespace="k8s-agent-demo")
 
     mock_event = MagicMock()
@@ -1655,7 +1655,7 @@ async def test_observation_agent_gemini_metrics_success():
     async def mock_run_async(*args, **kwargs):
         yield mock_event
 
-    with patch.dict(os.environ, {"GEMINI_API_KEY": "mock-api-key"}):
+    with patch.dict(os.environ, {"GEMINI_API_KEY": "mock-api-key", "GEMINI_MODEL": "gemini-3.8-flash"}):
         with patch("app.orchestrator.agents.observation_agent.Runner") as mock_runner_cls:
             mock_runner = MagicMock()
             mock_runner.run_async = mock_run_async
@@ -1687,7 +1687,7 @@ async def test_observation_agent_gemini_metrics_timeout():
         await asyncio.sleep(10.0)
         yield MagicMock()
 
-    with patch.dict(os.environ, {"GEMINI_API_KEY": "mock-api-key"}):
+    with patch.dict(os.environ, {"GEMINI_API_KEY": "mock-api-key", "GEMINI_MODEL": "gemini-3.8-flash"}):
         with patch("app.orchestrator.agents.observation_agent.Runner") as mock_runner_cls:
             mock_runner = MagicMock()
             mock_runner.run_async = mock_hanging_run_async
@@ -1724,7 +1724,7 @@ async def test_observation_agent_gemini_metrics_503_error():
         raise MockGoogleAPIError("503 Service Unavailable with key=AIzaSyD-12345678901234567890123456789012")
         yield MagicMock()
 
-    with patch.dict(os.environ, {"GEMINI_API_KEY": "mock-api-key"}):
+    with patch.dict(os.environ, {"GEMINI_API_KEY": "mock-api-key", "GEMINI_MODEL": "gemini-3.8-flash"}):
         with patch("app.orchestrator.agents.observation_agent.Runner") as mock_runner_cls:
             mock_runner = MagicMock()
             mock_runner.run_async = mock_failing_run_async
@@ -1764,7 +1764,7 @@ async def test_observation_agent_preserves_partial_traces_and_avoids_duplicate_s
         yield event_mock
         await asyncio.sleep(10.0)
 
-    with patch.dict(os.environ, {"GEMINI_API_KEY": "mock-api-key"}):
+    with patch.dict(os.environ, {"GEMINI_API_KEY": "mock-api-key", "GEMINI_MODEL": "gemini-3.8-flash"}):
         with patch("app.orchestrator.agents.observation_agent.Runner") as mock_runner_cls:
             mock_runner = MagicMock()
             mock_runner.run_async = mock_partial_then_timeout
@@ -1812,7 +1812,7 @@ async def test_remediation_planner_metrics_and_mcp_traces_success():
         mock_instance.aio.models.generate_content = AsyncMock(return_value=mock_resp)
         mock_client_cls.return_value = mock_instance
 
-        with patch.dict(os.environ, {"GEMINI_API_KEY": "mock-api-key"}):
+        with patch.dict(os.environ, {"GEMINI_API_KEY": "mock-api-key", "GEMINI_MODEL": "gemini-3.8-flash"}):
             proposals = await planner.plan_remediations(
                 diagnoses=diagnoses,
                 namespace="k8s-agent-demo",
@@ -1864,7 +1864,7 @@ async def test_remediation_planner_metrics_and_traces_on_503_fallback():
         )
         mock_client_cls.return_value = mock_instance
 
-        with patch.dict(os.environ, {"GEMINI_API_KEY": "mock-api-key"}):
+        with patch.dict(os.environ, {"GEMINI_API_KEY": "mock-api-key", "GEMINI_MODEL": "gemini-3.8-flash"}):
             proposals = await planner.plan_remediations(
                 diagnoses=diagnoses,
                 namespace="k8s-agent-demo",
@@ -1985,7 +1985,7 @@ async def test_pipeline_outcome_completed_with_gemini():
         self.remediation_provenance = "GEMINI_AGENT"
         return [mock_proposal]
 
-    with patch.dict(os.environ, {"GEMINI_API_KEY": "mock-api-key"}):
+    with patch.dict(os.environ, {"GEMINI_API_KEY": "mock-api-key", "GEMINI_MODEL": "gemini-3.8-flash"}):
         with patch("app.orchestrator.pipeline.ObservationAgent.observe", return_value=(mock_obs_report, [], "Synthesized")):
             with patch.object(RemediationPlanner, "plan_remediations", mock_plan_remediations_gemini):
                 result = await pipeline.execute(request=req, use_llm=True)
@@ -2028,7 +2028,7 @@ async def test_pipeline_outcome_completed_with_fallback_when_one_stage_falls_bac
         provenance=ProposalProvenance.DETERMINISTIC_FALLBACK,
     )
 
-    with patch.dict(os.environ, {"GEMINI_API_KEY": "mock-api-key"}):
+    with patch.dict(os.environ, {"GEMINI_API_KEY": "mock-api-key", "GEMINI_MODEL": "gemini-3.8-flash"}):
         with patch("app.orchestrator.pipeline.ObservationAgent.observe", return_value=(mock_obs_report, [], "Synthesized")):
             with patch("app.orchestrator.pipeline.RemediationPlanner.plan_remediations", return_value=[mock_fallback_proposal]):
                 # RemediationPlanner defaults to DETERMINISTIC_FALLBACK
