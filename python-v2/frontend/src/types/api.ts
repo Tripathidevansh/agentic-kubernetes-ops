@@ -1,34 +1,53 @@
 export interface HealthResponse {
   status: string;
+  service?: string;
   version: string;
   timestamp: string;
-  kubernetes_connected: boolean;
-  gemini_model: string;
+  cluster_connected: boolean;
+  kubernetes_connected?: boolean;
+  model: string;
+  gemini_model?: string;
+  mcp_server?: string;
+}
+
+export interface PodContainerStatus {
+  name: string;
+  state?: string | null;
+  reason?: string | null;
+  message?: string | null;
+  restart_count: number;
+  ready: boolean;
 }
 
 export interface PodOverviewItem {
   name: string;
   namespace: string;
   phase: string;
+  is_ready: boolean;
+  ready?: boolean;
+  is_scheduled?: boolean;
   restarts: number;
-  ready: boolean;
-  status_reason: string | null;
-  message: string | null;
-  created_at: string | null;
+  status_reason?: string | null;
+  message?: string | null;
+  created_at?: string | null;
   node_name: string | null;
+  container_statuses?: PodContainerStatus[];
+  owners?: { kind: string; name: string }[];
 }
 
 export interface ClusterOverviewResponse {
-  cluster_name: string;
+  cluster_name?: string;
   namespace: string;
   total_pods: number;
   running_pods: number;
   pending_pods: number;
   failed_pods: number;
-  crash_loop_pods: number;
-  total_restarts: number;
+  succeeded_pods?: number;
+  unknown_pods?: number;
+  crash_loop_pods?: number;
+  total_restarts?: number;
   incident_count: number;
-  namespaces: string[];
+  namespaces?: string[];
   incidents_summary: Record<string, number>;
   pods: PodOverviewItem[];
   collected_at: string;
@@ -63,23 +82,33 @@ export interface IncidentsResponse {
 
 export interface GeminiRequestMetric {
   stage: string;
-  request_index: number;
-  prompt_tokens?: number | null;
-  candidates_tokens?: number | null;
-  total_tokens?: number | null;
-  latency_seconds: number;
-  status: string;
+  model?: string;
+  started_at?: string;
+  completed_at?: string | null;
+  duration_ms?: number | null;
+  latency_seconds?: number;
+  success?: boolean;
+  status?: string;
+  status_code?: number | null;
   http_status_code?: number | null;
-  retries_attempted?: number | null;
+  error_type?: string | null;
   error_message?: string | null;
+  retries_attempted?: number | null;
+  fallback_triggered?: boolean;
+  fallback_reason?: string | null;
+  total_tokens?: number | null;
 }
 
 export interface AgentToolCallTrace {
-  stage: string;
+  call_id?: string;
+  agent_name?: string;
+  stage?: string;
   tool_name: string;
   arguments: Record<string, any>;
-  duration_seconds: number;
+  duration_ms?: number | null;
+  duration_seconds?: number;
   status: string;
+  result_summary?: string | null;
   error_message?: string | null;
   timestamp: string;
 }
@@ -95,7 +124,9 @@ export interface YamlPatch {
 export interface VerificationPlan {
   target_pod_phase?: string;
   target_phase?: string;
+  expected_conditions?: Record<string, any>[];
   expected_ready_condition?: boolean;
+  check_interval_seconds?: number;
   readiness_probe_initial_delay_seconds?: number;
   timeout_seconds?: number;
   negative_assertions?: string[];
@@ -224,4 +255,42 @@ export interface RemediationRejectionResponse {
   rejected_at: string;
   reason: string;
   message: string;
+}
+
+export interface GitOpsPreviewResponse {
+  proposal_id: string;
+  target_resource: string;
+  target_namespace: string;
+  target_file: string;
+  container_name: string;
+  current_image: string;
+  replacement_image: string;
+  diff: string;
+  is_approved: boolean;
+  can_prepare: boolean;
+  validation_messages: string[];
+  timestamp: string;
+}
+
+export interface GitOpsChangeRecord {
+  change_id: string;
+  proposal_id: string;
+  investigation_id?: string | null;
+  target_resource: string;
+  target_namespace: string;
+  target_file: string;
+  container_name: string;
+  current_image: string;
+  replacement_image: string;
+  diff: string;
+  branch_name?: string | null;
+  commit_hash?: string | null;
+  commit_message?: string | null;
+  status: string;
+  operator: string;
+  created_at: string;
+  prepared_at?: string | null;
+  pr_url?: string | null;
+  pr_number?: number | null;
+  error?: string | null;
 }

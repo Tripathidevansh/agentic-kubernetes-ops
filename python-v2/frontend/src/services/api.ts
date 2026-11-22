@@ -1,5 +1,7 @@
 import {
   ClusterOverviewResponse,
+  GitOpsChangeRecord,
+  GitOpsPreviewResponse,
   HealthResponse,
   IncidentsResponse,
   InvestigationCreateResponse,
@@ -105,7 +107,7 @@ class ApiService {
 
   async approveRemediation(
     proposalId: string,
-    reviewer: string = 'Alex Vance (SRE)',
+    reviewer: string = 'Operator',
     comments?: string
   ): Promise<RemediationApprovalResponse> {
     return this.request<RemediationApprovalResponse>(`/api/remediations/${encodeURIComponent(proposalId)}/approve`, {
@@ -119,15 +121,47 @@ class ApiService {
 
   async rejectRemediation(
     proposalId: string,
-    reviewer: string = 'Alex Vance (SRE)',
-    reason: string = 'Rejected via KafaKube8 Cockpit'
+    reviewer: string = 'Operator',
+    comments: string = 'Rejected via KafaKube8 Cockpit'
   ): Promise<RemediationRejectionResponse> {
     return this.request<RemediationRejectionResponse>(`/api/remediations/${encodeURIComponent(proposalId)}/reject`, {
       method: 'POST',
       body: JSON.stringify({
         reviewer,
-        reason,
+        comments,
       }),
+    });
+  }
+
+  // GitOps Remediation
+  async previewGitOps(proposalId: string, operator: string = 'Operator'): Promise<GitOpsPreviewResponse> {
+    return this.request<GitOpsPreviewResponse>('/api/gitops/preview', {
+      method: 'POST',
+      body: JSON.stringify({
+        proposal_id: proposalId,
+        operator,
+      }),
+    });
+  }
+
+  async prepareGitOps(proposalId: string, operator: string = 'Operator'): Promise<GitOpsChangeRecord> {
+    return this.request<GitOpsChangeRecord>('/api/gitops/prepare', {
+      method: 'POST',
+      body: JSON.stringify({
+        proposal_id: proposalId,
+        operator,
+      }),
+    });
+  }
+
+  async listGitOpsChanges(proposalId?: string): Promise<GitOpsChangeRecord[]> {
+    const query = proposalId ? `?proposal_id=${encodeURIComponent(proposalId)}` : '';
+    return this.request<GitOpsChangeRecord[]>(`/api/gitops/changes${query}`);
+  }
+
+  async createGitOpsPR(changeId: string): Promise<GitOpsChangeRecord> {
+    return this.request<GitOpsChangeRecord>(`/api/gitops/changes/${encodeURIComponent(changeId)}/pr`, {
+      method: 'POST',
     });
   }
 }

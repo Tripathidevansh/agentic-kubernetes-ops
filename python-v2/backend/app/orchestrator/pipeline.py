@@ -50,10 +50,12 @@ class InvestigationPipeline:
         model_name: Optional[str] = None,
         stage_timeout_seconds: Optional[float] = None,
         total_timeout_seconds: Optional[float] = None,
+        allow_best_effort: bool = False,
     ):
         self._external_bridge = bridge is not None
         self.bridge = bridge or K8sMcpClientBridge()
         self.model_name = model_name or os.environ.get("GEMINI_MODEL", DEFAULT_GEMINI_MODEL)
+        self.allow_best_effort = allow_best_effort
         if stage_timeout_seconds is not None:
             self.stage_timeout = float(stage_timeout_seconds)
         else:
@@ -147,7 +149,11 @@ class InvestigationPipeline:
                 result.status = InvestigationStatus.PLANNING
                 logger.info("[%s] Starting Stage 3: Remediation Planning", investigation_id)
 
-                rem_planner = RemediationPlanner(bridge=self.bridge, model_name=self.model_name)
+                rem_planner = RemediationPlanner(
+                    bridge=self.bridge,
+                    model_name=self.model_name,
+                    allow_best_effort=self.allow_best_effort,
+                )
                 proposals = await asyncio.wait_for(
                     rem_planner.plan_remediations(
                         diagnoses=diagnoses,

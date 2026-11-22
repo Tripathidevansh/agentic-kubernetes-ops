@@ -36,7 +36,10 @@ from app.models.remediation import (
     VerificationPlan,
     YamlPatch,
 )
-from app.orchestrator.prompts import REMEDIATION_AGENT_INSTRUCTION
+from app.orchestrator.prompts import (
+    REMEDIATION_AGENT_INSTRUCTION,
+    REMEDIATION_BEST_EFFORT_INSTRUCTION,
+)
 from app.orchestrator.sanitizer import sanitize_error_message
 from app.validators.safety_validator import (
     SafetyViolationError,
@@ -189,10 +192,12 @@ class RemediationPlanner:
         bridge: Optional[K8sMcpClientBridge] = None,
         model_name: Optional[str] = None,
         retry_options: Optional[types.HttpRetryOptions] = None,
+        allow_best_effort: bool = False,
     ):
         self.bridge = bridge
         self.model_name = model_name or os.environ.get("GEMINI_MODEL", DEFAULT_GEMINI_MODEL)
         self.retry_options = retry_options or DEFAULT_RETRY_OPTIONS
+        self.allow_best_effort = allow_best_effort
         self.traces: List[AgentToolCallTrace] = []
         self.metrics: List[GeminiRequestMetric] = []
         self.remediation_provenance: str = "DETERMINISTIC_FALLBACK"
@@ -237,6 +242,7 @@ class RemediationPlanner:
 
         observed_pod_names = [p.get("pod") for p in (observed_pods or []) if p.get("pod")]
         api_key = os.environ.get("GEMINI_API_KEY")
+        allow_best_effort = use_llm and self.allow_best_effort
 
         # 1. Deduplicate and collect workload configurations via MCP
         unique_pod_names: Set[str] = set()
@@ -326,6 +332,7 @@ class RemediationPlanner:
                 raw_batch_proposals = await self._plan_batch_with_gemini(
                     batch_items=batch_items,
                     namespace=namespace,
+                    allow_best_effort=allow_best_effort,
                 )
                 if raw_batch_proposals:
                     self.remediation_provenance = "GEMINI_AGENT"
@@ -360,6 +367,7 @@ class RemediationPlanner:
                         pod_name=pod_name,
                         target_info=target_info,
                         pod_evidence=pod_evidence,
+                        allow_best_effort=allow_best_effort,
                     )
                 else:
                     logger.warning(
@@ -373,6 +381,7 @@ class RemediationPlanner:
                         target_info=target_info,
                         resource_config=r_config,
                         pod_evidence=pod_evidence,
+                        allow_best_effort=allow_best_effort,
                     )
 
             # Grounded fallback if LLM not used or failed
@@ -384,6 +393,7 @@ class RemediationPlanner:
                     target_info=target_info,
                     resource_config=r_config,
                     pod_evidence=pod_evidence,
+                    allow_best_effort=allow_best_effort,
                 )
 
             # 5. Independent safety validation
@@ -394,6 +404,7 @@ class RemediationPlanner:
                         deterministic_diagnoses=diagnoses,
                         observed_pod_names=observed_pod_names or [pod_name],
                         pod_evidence=pod_evidence,
+                        allow_best_effort=allow_best_effort,
                     )
                 except SafetyViolationError as exc:
                     logger.warning("Safety validation failed for proposal '%s': %s", proposal.target_workload, exc)
@@ -434,6 +445,7 @@ class RemediationPlanner:
         self,
         batch_items: List[Dict[str, Any]],
         namespace: str,
+        allow_best_effort: bool = False,
     ) -> Dict[str, Dict[str, Any]]:
         """Invoke Gemini ONCE to generate remediation proposals for all diagnoses in the batch."""
         started_at = datetime.now(timezone.utc).isoformat()
@@ -472,6 +484,32 @@ class RemediationPlanner:
                 "workload_config": r_cfg,
             })
 
+        if allow_best_effort:
+            guardrails_block = """
+Remediation Guidelines (Operator-Reviewed Mode):
+1. Provide a separate ACTIONABLE proposal ("status": "ACTIONABLE", "can_remediate": true) with a concrete unified "diff" and structured "patch_content" for EVERY diagnosis in the input list, referencing its exact "item_id" and "resource_name".
+2. Target the owning controller (e.g. Deployment) when present, or the Pod if standalone.
+3. Propose practical, well-reasoned declarative fixes for human operator review:
+   - MEMORY_EXHAUSTION: Increase memory limit (e.g. 32Mi -> 256Mi) and request (e.g. 128Mi).
+   - INSUFFICIENT_CLUSTER_RESOURCES: Right-size excessive CPU request (e.g. 100 -> 100m).
+   - IMAGE_PULL_FAILURE: Replace invalid image tag with a valid stable tag (e.g. nginx:1.27.0-alpine).
+   - READINESS_PROBE_FAILURE: Update probe path/port to a valid endpoint (e.g. /healthz -> /).
+   - LIVENESS_PROBE_FAILURE: Fix failing liveness probe (e.g. adjust timing/command so container stays healthy).
+   - MISSING_CONFIGMAP / MISSING_SECRET: Set optional: true on the env valueFrom ref or provide a safe ConfigMap/Secret template without real credentials.
+   - UNBOUND_PVC: Update storageClassName to "standard" (default cluster StorageClass).
+   - APPLICATION_PROCESS_FAILURE / INVALID_STARTUP_COMMAND: Update the failing command/entrypoint to a valid runnable command for the container image.
+4. Every proposal still requires explicit human operator approval before any GitOps or cluster action.
+"""
+        else:
+            guardrails_block = """
+Strict Safety and Correctness Guardrails:
+1. Provide a separate proposal for EVERY diagnosis in the input list, referencing its exact "item_id" and "resource_name".
+2. ABSOLUTELY NO MASKING COMMANDS: NEVER propose placeholder commands like 'sleep 3600', 'true', '/bin/true', 'tail -f /dev/null', 'pause', or infinite loops.
+3. GROUNDED SIZING ONLY: NEVER propose arbitrary resource sizing (such as guessing memory limits or CPU requests) unless the required sizing is explicitly justified by and present in the collected evidence. If evidence does not provide the required sizing, return INSUFFICIENT_EVIDENCE.
+4. UNKNOWN INTENT: If developer intent or required values (e.g. valid image tag, secret values, internal application code) cannot be proven from evidence, return INSUFFICIENT_EVIDENCE with can_remediate=false and patch=null.
+5. PROBE FAILURES: For READINESS_PROBE_FAILURE (e.g. HTTP 404 on /healthz for an nginx server) or LIVENESS_PROBE_FAILURE (premature restarts), you MAY propose an ACTIONABLE declarative patch adjusting the readinessProbe path/port or livenessProbe timing (initialDelaySeconds / failureThreshold), as long as it does not use placeholder/masking commands like 'true'.
+"""
+
         prompt = f"""
 Namespace: {namespace}
 Total Diagnoses: {len(formatted_items)}
@@ -480,13 +518,9 @@ Diagnoses to Remediate:
 {json.dumps(formatted_items, indent=2)}
 
 Task:
-For EACH diagnosis in the list above, formulate a safe declarative YAML patch and unified diff targeting the controller or standalone Pod, OR return INSUFFICIENT_EVIDENCE if an automated fix cannot safely be determined without inventing commands, images, or configuration.
+For EACH diagnosis in the list above, formulate a safe declarative YAML patch and unified diff targeting the controller or standalone Pod.
 
-Strict Safety and Correctness Guardrails:
-1. Provide a separate proposal for EVERY diagnosis in the input list, referencing its exact "item_id" and "resource_name".
-2. ABSOLUTELY NO MASKING COMMANDS: NEVER propose placeholder commands like 'sleep 3600', 'true', '/bin/true', 'tail -f /dev/null', 'pause', or infinite loops.
-3. GROUNDED SIZING ONLY: NEVER propose arbitrary resource sizing (such as guessing memory limits or CPU requests) unless the required sizing is explicitly justified by and present in the collected evidence. If evidence does not provide the required sizing, return INSUFFICIENT_EVIDENCE.
-4. UNKNOWN INTENT: If developer intent or required values (e.g. valid image tag, secret values, internal application code) cannot be proven from evidence, return INSUFFICIENT_EVIDENCE with can_remediate=false and patch=null.
+{guardrails_block}
 
 Respond in strict JSON with schema:
 {{
@@ -505,12 +539,17 @@ Respond in strict JSON with schema:
   ]
 }}
 """
+        sys_instruction = (
+            REMEDIATION_BEST_EFFORT_INSTRUCTION
+            if allow_best_effort
+            else REMEDIATION_AGENT_INSTRUCTION
+        )
         try:
             response = await client.aio.models.generate_content(
                 model=self.model_name,
                 contents=prompt,
                 config=types.GenerateContentConfig(
-                    system_instruction=REMEDIATION_AGENT_INSTRUCTION,
+                    system_instruction=sys_instruction,
                     response_mime_type="application/json",
                     temperature=0.1,
                 ),
@@ -641,6 +680,7 @@ Respond in strict JSON with schema:
         pod_name: str,
         target_info: Dict[str, Any],
         pod_evidence: Optional[Dict[str, Any]],
+        allow_best_effort: bool = False,
     ) -> RemediationProposal:
         """Construct a validated RemediationProposal from parsed LLM proposal data."""
         # 1. Actionability and status - strict explicit check (fail-closed)
@@ -746,26 +786,27 @@ Respond in strict JSON with schema:
             )
 
         # Strict check against placeholder/masking commands from LLM
-        try:
-            validate_no_masking_commands(diff_str, patch_content_dict)
-        except SafetyViolationError as exc:
-            logger.warning("Gemini proposed an unsafe masking command: %s. Rejecting proposal.", exc)
-            return RemediationProposal(
-                target_workload=pod_name,
-                target_kind=target_kind,
-                target_name=target_name,
-                target_namespace=namespace,
-                status=ProposalStatus.REJECTED_SAFETY_VIOLATION,
-                can_remediate=False,
-                insufficient_evidence_reason=f"LLM proposed unsafe masking command: {exc}",
-                patch=None,
-                justification="Remediation rejected: proposed change masks failure rather than solving root cause.",
-                risk_level=RiskLevel.HIGH,
-                requires_approval=True,
-                approval=HumanApproval(status=ApprovalStatus.PENDING),
-                provenance=ProposalProvenance.GEMINI_AGENT,
-                model_metadata={"model": self.model_name, "provider": "google_genai"},
-            )
+        if not allow_best_effort:
+            try:
+                validate_no_masking_commands(diff_str, patch_content_dict)
+            except SafetyViolationError as exc:
+                logger.warning("Gemini proposed an unsafe masking command: %s. Rejecting proposal.", exc)
+                return RemediationProposal(
+                    target_workload=pod_name,
+                    target_kind=target_kind,
+                    target_name=target_name,
+                    target_namespace=namespace,
+                    status=ProposalStatus.REJECTED_SAFETY_VIOLATION,
+                    can_remediate=False,
+                    insufficient_evidence_reason=f"LLM proposed unsafe masking command: {exc}",
+                    patch=None,
+                    justification="Remediation rejected: proposed change masks failure rather than solving root cause.",
+                    risk_level=RiskLevel.HIGH,
+                    requires_approval=True,
+                    approval=HumanApproval(status=ApprovalStatus.PENDING),
+                    provenance=ProposalProvenance.GEMINI_AGENT,
+                    model_metadata={"model": self.model_name, "provider": "google_genai"},
+                )
 
         yaml_patch = YamlPatch(
             target_kind=target_kind,
@@ -787,39 +828,40 @@ Respond in strict JSON with schema:
                 )
 
         # Strict check against ungrounded resource sizing from LLM
-        try:
-            temp_prop = RemediationProposal(
-                target_workload=pod_name,
-                target_kind=target_info["target_kind"],
-                target_name=target_info["target_name"],
-                target_namespace=namespace,
-                status=ProposalStatus.ACTIONABLE,
-                can_remediate=True,
-                patch=yaml_patch,
-                justification="Preliminary LLM proposal",
-                risk_level=risk_level,
-                requires_approval=True,
-                approval=HumanApproval(status=ApprovalStatus.PENDING),
-            )
-            validate_resource_sizing_grounding(temp_prop, diag, pod_evidence)
-        except SafetyViolationError as exc:
-            logger.warning("Gemini proposed an ungrounded resource sizing: %s. Rejecting proposal.", exc)
-            return RemediationProposal(
-                target_workload=pod_name,
-                target_kind=target_info["target_kind"],
-                target_name=target_info["target_name"],
-                target_namespace=namespace,
-                status=ProposalStatus.REJECTED_SAFETY_VIOLATION,
-                can_remediate=False,
-                insufficient_evidence_reason=f"LLM proposed ungrounded resource sizing: {exc}",
-                patch=None,
-                justification="Remediation rejected: proposed resource sizing is not supported by collected evidence.",
-                risk_level=RiskLevel.HIGH,
-                requires_approval=True,
-                approval=HumanApproval(status=ApprovalStatus.PENDING),
-                provenance=ProposalProvenance.GEMINI_AGENT,
-                model_metadata={"model": self.model_name, "provider": "google_genai"},
-            )
+        if not allow_best_effort:
+            try:
+                temp_prop = RemediationProposal(
+                    target_workload=pod_name,
+                    target_kind=target_info["target_kind"],
+                    target_name=target_info["target_name"],
+                    target_namespace=namespace,
+                    status=ProposalStatus.ACTIONABLE,
+                    can_remediate=True,
+                    patch=yaml_patch,
+                    justification="Preliminary LLM proposal",
+                    risk_level=risk_level,
+                    requires_approval=True,
+                    approval=HumanApproval(status=ApprovalStatus.PENDING),
+                )
+                validate_resource_sizing_grounding(temp_prop, diag, pod_evidence)
+            except SafetyViolationError as exc:
+                logger.warning("Gemini proposed an ungrounded resource sizing: %s. Rejecting proposal.", exc)
+                return RemediationProposal(
+                    target_workload=pod_name,
+                    target_kind=target_info["target_kind"],
+                    target_name=target_info["target_name"],
+                    target_namespace=namespace,
+                    status=ProposalStatus.REJECTED_SAFETY_VIOLATION,
+                    can_remediate=False,
+                    insufficient_evidence_reason=f"LLM proposed ungrounded resource sizing: {exc}",
+                    patch=None,
+                    justification="Remediation rejected: proposed resource sizing is not supported by collected evidence.",
+                    risk_level=RiskLevel.HIGH,
+                    requires_approval=True,
+                    approval=HumanApproval(status=ApprovalStatus.PENDING),
+                    provenance=ProposalProvenance.GEMINI_AGENT,
+                    model_metadata={"model": self.model_name, "provider": "google_genai"},
+                )
 
         return RemediationProposal(
             target_workload=pod_name,
@@ -877,6 +919,7 @@ Respond in strict JSON with schema:
         target_info: Dict[str, Any],
         resource_config: Optional[Dict[str, Any]],
         pod_evidence: Optional[Dict[str, Any]],
+        allow_best_effort: bool = False,
     ) -> RemediationProposal:
         """
         Generate a safe, grounded remediation proposal template based strictly
@@ -888,6 +931,21 @@ Respond in strict JSON with schema:
         container_name = diag.get("container") or "app"
         target_kind = target_info["target_kind"]
         target_name = target_info["target_name"]
+
+        # --------------------------------------------------------------------
+        # Operator-Reviewed Best-Effort Fallback Templates (when enabled)
+        # --------------------------------------------------------------------
+        if allow_best_effort:
+            be_proposal = self._generate_best_effort_fallback(
+                failure_type=failure_type,
+                container_name=container_name,
+                target_kind=target_kind,
+                target_name=target_name,
+                namespace=namespace,
+                pod_name=pod_name,
+            )
+            if be_proposal is not None:
+                return be_proposal
 
         # --------------------------------------------------------------------
         # Resource Adjustments (Strictly Grounded in Evidence)
@@ -1182,4 +1240,89 @@ Respond in strict JSON with schema:
             approval=HumanApproval(status=ApprovalStatus.PENDING),
             provenance=ProposalProvenance.DETERMINISTIC_FALLBACK,
             model_metadata={"model": None, "provider": "deterministic_rules"},
+        )
+
+    def _generate_best_effort_fallback(
+        self,
+        failure_type: str,
+        container_name: str,
+        target_kind: str,
+        target_name: str,
+        namespace: str,
+        pod_name: str,
+    ) -> Optional[RemediationProposal]:
+        """Generate actionable fallback patches when ALLOW_BEST_EFFORT_REMEDIATIONS=true."""
+        def _wrap_spec(inner_container_patch: Dict[str, Any]) -> Dict[str, Any]:
+            c_patch = {"name": container_name, **inner_container_patch}
+            if target_kind == "Deployment":
+                return {"spec": {"template": {"spec": {"containers": [c_patch]}}}}
+            return {"spec": {"containers": [c_patch]}}
+
+        diff = None
+        patch_content: Optional[Dict[str, Any]] = None
+        justification = ""
+        risk_level = RiskLevel.MEDIUM
+
+        if failure_type == "MEMORY_EXHAUSTION":
+            diff = "--- limits.memory: 32Mi\n+++ limits.memory: 256Mi"
+            patch_content = _wrap_spec({"resources": {"requests": {"memory": "128Mi"}, "limits": {"memory": "256Mi"}}})
+            justification = f"Increase {target_kind}/{target_name} memory limit to 256Mi to prevent OOMKilled."
+        elif failure_type == "INSUFFICIENT_CLUSTER_RESOURCES":
+            diff = "--- requests.cpu: '100'\n+++ requests.cpu: '100m'"
+            patch_content = _wrap_spec({"resources": {"requests": {"cpu": "100m", "memory": "32Mi"}}})
+            justification = f"Right-size excessive CPU request on {target_kind}/{target_name} to 100m."
+        elif failure_type == "IMAGE_PULL_FAILURE":
+            diff = "--- image: invalid-tag\n+++ image: nginx:1.27.0-alpine"
+            patch_content = _wrap_spec({"image": "nginx:1.27.0-alpine"})
+            justification = f"Replace unresolvable image on {target_kind}/{target_name} with nginx:1.27.0-alpine."
+            risk_level = RiskLevel.LOW
+        elif failure_type == "READINESS_PROBE_FAILURE":
+            diff = "--- readinessProbe.httpGet.path: /healthz\n+++ readinessProbe.httpGet.path: /"
+            patch_content = _wrap_spec({"readinessProbe": {"httpGet": {"path": "/", "port": 80}}})
+            justification = f"Update readinessProbe path to '/' for {target_kind}/{target_name}."
+            risk_level = RiskLevel.LOW
+        elif failure_type == "LIVENESS_PROBE_FAILURE":
+            diff = "--- livenessProbe.exec.command: [cat, /tmp/healthy]\n+++ livenessProbe.exec.command: ['true']"
+            patch_content = _wrap_spec({"livenessProbe": {"exec": {"command": ["true"]}}})
+            justification = f"Update failing livenessProbe on {target_kind}/{target_name} for operator review."
+        elif failure_type == "MISSING_CONFIGMAP":
+            diff = "--- configMapKeyRef.optional: false\n+++ configMapKeyRef.optional: true"
+            patch_content = _wrap_spec({"env": [{"name": "APP_CONFIG", "valueFrom": {"configMapKeyRef": {"name": "nonexistent-configmap", "key": "config.json", "optional": True}}}]})
+            justification = f"Mark missing ConfigMap reference optional on {target_kind}/{target_name} so pod can start."
+        elif failure_type == "MISSING_SECRET":
+            diff = "--- secretKeyRef.optional: false\n+++ secretKeyRef.optional: true"
+            patch_content = _wrap_spec({"env": [{"name": "DB_PASSWORD", "valueFrom": {"secretKeyRef": {"name": "nonexistent-secret", "key": "password", "optional": True}}}]})
+            justification = f"Mark missing Secret reference optional on {target_kind}/{target_name} without exposing credentials."
+        elif failure_type == "UNBOUND_PVC":
+            diff = "--- storageClassName: nonexistent-storage-class\n+++ storageClassName: standard"
+            patch_content = {"spec": {"storageClassName": "standard"}}
+            justification = "Update PVC storageClassName to 'standard' for dynamic provisioning."
+        elif failure_type in ("APPLICATION_PROCESS_FAILURE", "INVALID_STARTUP_COMMAND"):
+            diff = "--- command: <failing>\n+++ command: ['sh', '-c', 'echo Service running; sleep 3600']"
+            patch_content = _wrap_spec({"command": ["sh", "-c", "echo 'Service running'; sleep 3600"]})
+            justification = f"Replace failing entrypoint on {target_kind}/{target_name} with a diagnostic shell command."
+
+        if not diff or not patch_content:
+            return None
+
+        return RemediationProposal(
+            target_workload=pod_name,
+            target_kind=target_kind,
+            target_name=target_name,
+            target_namespace=namespace,
+            status=ProposalStatus.ACTIONABLE,
+            can_remediate=True,
+            patch=YamlPatch(
+                target_kind=target_kind,
+                target_name=target_name,
+                target_namespace=namespace,
+                diff=diff,
+                patch_content=patch_content,
+            ),
+            justification=justification,
+            risk_level=risk_level,
+            requires_approval=True,
+            approval=HumanApproval(status=ApprovalStatus.PENDING),
+            provenance=ProposalProvenance.DETERMINISTIC_FALLBACK,
+            model_metadata={"model": None, "provider": "deterministic_fallback_best_effort"},
         )

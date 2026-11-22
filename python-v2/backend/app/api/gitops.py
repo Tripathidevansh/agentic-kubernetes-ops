@@ -163,3 +163,27 @@ async def prepare_gitops_change(request: GitOpsChangeRequest) -> GitOpsChangeRec
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=str(git_err),
         )
+
+
+@router.post("/changes/{change_id}/pr", response_model=GitOpsChangeRecord)
+async def create_github_pr(
+    change_id: str,
+    base_branch: Optional[str] = Query(default=None, description="Target base branch (defaults to GITHUB_BASE_BRANCH or main)"),
+) -> GitOpsChangeRecord:
+    """
+    Push a prepared local GitOps branch to GitHub and open a Pull Request.
+    Requires the change to be in BRANCH_PREPARED status (post-human approval).
+    """
+    service = get_gitops_service()
+    try:
+        return await service.create_github_pr(change_id=change_id, base_branch=base_branch)
+    except GitOpsValidationError as val_err:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(val_err),
+        )
+    except GitOpsError as git_err:
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail=str(git_err),
+        )

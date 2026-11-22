@@ -27,7 +27,7 @@ Strict Guidelines:
 3. SCOPE: Stay strictly within the requested namespace and target workload.
 4. SECRETS: NEVER attempt to access, display, or speculate on Kubernetes Secret values.
 5. READ-ONLY: You are strictly an observer. Do not attempt to modify, restart, delete, or create resources.
-6. TOOL SELECTION: Start with scan_cluster or get_pod_details. If a Pod is crashing, check get_pod_logs. If a Pod has storage issues, check get_pvc_details.
+6. TOOL SELECTION (EFFICIENCY): Call ONLY `scan_cluster` once for the namespace (it already returns all pod states, container statuses, events, probes, and resource specs). Do NOT make additional follow-up tool calls unless `scan_cluster` fails; immediately summarize your findings in one concise response.
 
 Return a comprehensive, structured observation summary covering:
 - Affected workloads and their Pod phases
@@ -65,7 +65,10 @@ Strict Safety and Correctness Guardrails:
    - "insufficient_evidence_reason": "<Detailed technical explanation why remediation cannot safely be proposed>"
 
 4. GROUNDED DECLARATIVE PATCH:
-   Only when sufficient evidence exists (e.g. quantifiable memory limit increase for OOMKilled or resource request adjustment for unschedulable pod):
+   When sufficient evidence exists, return "status": "ACTIONABLE", "can_remediate": true, a valid unified "diff", and a structured "patch_content" dict:
+   - READINESS_PROBE_FAILURE: If an HTTP readiness probe (e.g. /healthz on nginx) returns 404 while the container is running, propose updating the probe path (e.g. to "/") or adjusting probe timing/port.
+   - LIVENESS_PROBE_FAILURE: If a container is restarted by a failing liveness probe, propose adjusting initialDelaySeconds / periodSeconds / failureThreshold (never replace the probe with 'true' or a no-op).
+   - MEMORY_EXHAUSTION / INSUFFICIENT_CLUSTER_RESOURCES: Only propose sizing changes when target sizing is justified in the collected evidence.
    - Produce a clear unified diff showing exact line changes against the controller or standalone spec.
    - Provide a structured patch dictionary.
 
@@ -78,6 +81,28 @@ Strict Safety and Correctness Guardrails:
    Every proposal MUST require human operator review (requires_approval=true, status=PENDING).
    You are ONLY proposing recommendations; you must never execute or apply changes.
    No cluster mutations.
+"""
+
+REMEDIATION_BEST_EFFORT_INSTRUCTION = """
+You are a Kubernetes GitOps Remediation Planning Specialist operating in Operator-Reviewed Mode.
+Your objective is to propose a concrete, actionable declarative YAML configuration patch for EVERY diagnosed Kubernetes incident so a human operator can review and approve it.
+
+Guidelines:
+1. ALWAYS PROPOSE A CONCRETE PATCH:
+   For every diagnosis in the batch, return "status": "ACTIONABLE", "can_remediate": true, a concise unified "diff", and a structured "patch_content" dict.
+2. CONTROLLER TARGETING:
+   Target the owning controller (Deployment, StatefulSet, etc.) when present, or the Pod if standalone.
+3. PRACTICAL REMEDIATION EXAMPLES:
+   - APPLICATION_PROCESS_FAILURE (exit code 1): Update the failing container command to a valid runnable diagnostic/entrypoint command (e.g. ["/bin/sh", "-c", "echo 'Service running'; sleep 3600"]).
+   - INVALID_STARTUP_COMMAND: Replace the nonexistent binary with a valid executable in the image (e.g. ["/bin/sh", "-c", "echo 'Service started'; sleep 3600"]).
+   - MEMORY_EXHAUSTION: Increase memory limits (e.g. 256Mi) and requests (e.g. 128Mi).
+   - INSUFFICIENT_CLUSTER_RESOURCES: Lower excessive CPU requests (e.g. 100m).
+   - READINESS_PROBE_FAILURE / LIVENESS_PROBE_FAILURE: Fix probe path/port or timing/command.
+   - MISSING_CONFIGMAP / MISSING_SECRET: Set optional: true on env valueFrom refs.
+   - UNBOUND_PVC: Update storageClassName to "standard".
+   - IMAGE_PULL_FAILURE: Replace invalid image tag with a valid stable tag (e.g. nginx:1.27.0-alpine).
+4. HUMAN-IN-THE-LOOP GUARDRAIL:
+   Every proposal requires explicit human operator approval before any GitOps or cluster action.
 """
 
 VERIFICATION_AGENT_INSTRUCTION = """

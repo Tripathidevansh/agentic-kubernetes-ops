@@ -113,6 +113,15 @@ export const ResourcesView: React.FC<ResourcesViewProps> = ({
                 filteredPods.map((p, idx) => {
                   const isRunning = p.phase.toLowerCase() === 'running';
                   const isPending = p.phase.toLowerCase() === 'pending';
+                  const isReady = p.is_ready ?? p.ready ?? false;
+                  const firstStatus = p.container_statuses?.[0];
+                  const reasonText =
+                    p.status_reason ||
+                    p.message ||
+                    firstStatus?.reason ||
+                    firstStatus?.message ||
+                    firstStatus?.state ||
+                    '—';
 
                   return (
                     <tr key={idx} className="hover:bg-surface-container transition-colors">
@@ -133,8 +142,8 @@ export const ResourcesView: React.FC<ResourcesViewProps> = ({
                         </span>
                       </td>
                       <td className="py-2.5 px-space-md whitespace-nowrap">
-                        <span className={p.ready ? 'text-tertiary font-bold' : 'text-error font-bold'}>
-                          {p.ready ? 'Yes' : 'No'}
+                        <span className={isReady ? 'text-tertiary font-bold' : 'text-error font-bold'}>
+                          {isReady ? 'Yes' : 'No'}
                         </span>
                       </td>
                       <td className="py-2.5 px-space-md text-on-surface whitespace-nowrap">
@@ -143,10 +152,10 @@ export const ResourcesView: React.FC<ResourcesViewProps> = ({
                         </span>
                       </td>
                       <td className="py-2.5 px-space-md text-on-surface-variant whitespace-nowrap">
-                        {p.node_name || 'minikube'}
+                        {p.node_name || 'Unscheduled'}
                       </td>
-                      <td className="py-2.5 px-space-md text-outline truncate max-w-xs">
-                        {p.status_reason || p.message || '—'}
+                      <td className="py-2.5 px-space-md text-outline truncate max-w-xs" title={reasonText}>
+                        {reasonText}
                       </td>
                       <td className="py-2.5 px-space-md text-right whitespace-nowrap">
                         <button

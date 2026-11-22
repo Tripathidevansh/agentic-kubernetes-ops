@@ -1,4 +1,19 @@
-import React from 'react';
+import React, { useState } from 'react';
+
+export interface OperatorProfile {
+  id: string;
+  name: string;
+  role: 'Cluster Admin' | 'Guest';
+  initials: string;
+  isGuest: boolean;
+}
+
+export const OPERATOR_PROFILES: OperatorProfile[] = [
+  { id: 'devansh', name: 'Devansh', role: 'Cluster Admin', initials: 'DV', isGuest: false },
+  { id: 'saksham', name: 'Saksham', role: 'Cluster Admin', initials: 'SK', isGuest: false },
+  { id: 'samyak', name: 'Samyak', role: 'Cluster Admin', initials: 'SM', isGuest: false },
+  { id: 'guest', name: 'Guest', role: 'Guest', initials: 'GU', isGuest: true },
+];
 
 export type NavTab =
   | 'overview'
@@ -16,6 +31,8 @@ interface SidebarProps {
   incidentCount: number;
   remediationCount: number;
   clusterConnected: boolean;
+  activeOperator: OperatorProfile;
+  onSelectOperator: (op: OperatorProfile) => void;
 }
 
 export const Sidebar: React.FC<SidebarProps> = ({
@@ -24,9 +41,11 @@ export const Sidebar: React.FC<SidebarProps> = ({
   incidentCount,
   remediationCount,
   clusterConnected,
+  activeOperator,
+  onSelectOperator,
 }) => {
-  const EMBLEM_URL =
-    'https://lh3.googleusercontent.com/aida/ALJJyrBxbx6bhuAVcfoPObd9_nkQgU19q4sVtwCPyo7Np0cJWfQbEdGjNDyZQy_0Lc81h85Z5BrY9Z6SZ898AMS7uJ0lSmIisSvmZTRGGUFCjoMOhPSpwziF5OHl4RE9SDxNxvJ4GI07md8ETPWytkgDdJYWs-_SH8sEUcdqBvpSE_jlt3h1_BmWFeAotGsTGN5l3VJWpQYLSNCO0Hmvr5IN1T-bZGgWZpQS1W71cRKPRqZU_w';
+  const [profileOpen, setProfileOpen] = useState(false);
+  const EMBLEM_URL = '/logo.png';
 
   const navItems: { id: NavTab; label: string; icon: string; badge?: number }[] = [
     { id: 'overview', label: 'Overview', icon: 'dashboard' },
@@ -84,9 +103,9 @@ export const Sidebar: React.FC<SidebarProps> = ({
           </span>
         </div>
 
-        {/* Cluster Switcher */}
+        {/* Cluster Status Badge */}
         <div className="p-gutter">
-          <div className="flex items-center justify-between px-space-sm py-space-xs bg-surface-container rounded-lg cursor-pointer hover:bg-surface-container-high transition-colors">
+          <div className="flex items-center justify-between px-space-sm py-space-xs bg-surface-container rounded-lg">
             <div className="flex items-center gap-space-xs truncate">
               <span
                 className={`h-2 w-2 rounded-full shrink-0 ${
@@ -94,12 +113,9 @@ export const Sidebar: React.FC<SidebarProps> = ({
                 }`}
               />
               <span className="font-code-block text-code-block text-on-surface truncate">
-                Local K8s (Prod)
+                Local K8s ({clusterConnected ? 'Online' : 'Offline'})
               </span>
             </div>
-            <span className="material-symbols-outlined text-[16px] text-on-surface-variant">
-              unfold_more
-            </span>
           </div>
         </div>
 
@@ -169,28 +185,73 @@ export const Sidebar: React.FC<SidebarProps> = ({
         </nav>
       </div>
 
-      {/* Operator User Card */}
-      <div className="p-gutter border-t border-surface-container-high/40 bg-surface-container-lowest">
-        <div className="flex items-center justify-between p-space-xs rounded-lg hover:bg-surface-container transition-colors cursor-pointer">
-          <div className="flex items-center gap-space-xs">
-            <div className="w-8 h-8 rounded-full bg-surface-container-high flex items-center justify-center font-headline-sm text-headline-sm text-primary font-bold">
-              OP
+      {/* Operator User Card with Dropdown */}
+      <div className="relative p-gutter border-t border-surface-container-high/40 bg-surface-container-lowest">
+        {profileOpen && (
+          <div className="absolute left-3 right-3 bottom-full mb-2 bg-surface-container-high border border-outline-variant rounded-lg shadow-2xl py-1 z-50">
+            <div className="px-3 py-1 text-[10px] font-mono uppercase tracking-wider text-outline border-b border-surface-container">
+              Switch Operator Profile
             </div>
-            <div className="flex flex-col text-left">
+            {OPERATOR_PROFILES.map((profile) => {
+              const isSelected = profile.id === activeOperator.id;
+              return (
+                <button
+                  key={profile.id}
+                  type="button"
+                  onClick={() => {
+                    onSelectOperator(profile);
+                    setProfileOpen(false);
+                  }}
+                  className={`w-full flex items-center justify-between px-3 py-2 text-left transition-colors ${
+                    isSelected
+                      ? 'bg-surface-container-highest text-primary'
+                      : 'text-on-surface hover:bg-surface-container'
+                  }`}
+                >
+                  <div className="flex items-center gap-2 min-w-0">
+                    <span className="w-6 h-6 rounded-full bg-surface-container flex items-center justify-center text-[10px] font-mono font-bold text-primary shrink-0">
+                      {profile.initials}
+                    </span>
+                    <div className="flex flex-col leading-tight truncate">
+                      <span className="text-xs font-semibold truncate">{profile.name}</span>
+                      <span className="text-[10px] font-mono text-on-surface-variant">
+                        {profile.role}
+                      </span>
+                    </div>
+                  </div>
+                  {isSelected && (
+                    <span className="material-symbols-outlined text-[16px] text-primary">check</span>
+                  )}
+                </button>
+              );
+            })}
+          </div>
+        )}
+
+        <button
+          type="button"
+          onClick={() => setProfileOpen((v) => !v)}
+          className="w-full flex items-center justify-between p-space-xs rounded-lg hover:bg-surface-container transition-colors cursor-pointer"
+        >
+          <div className="flex items-center gap-space-xs min-w-0">
+            <div className="w-8 h-8 rounded-full bg-surface-container-high flex items-center justify-center font-headline-sm text-headline-sm text-primary font-bold shrink-0">
+              {activeOperator.initials}
+            </div>
+            <div className="flex flex-col text-left truncate">
               <span className="font-headline-sm text-headline-sm text-on-surface truncate">
-                Alex Vance
+                {activeOperator.name}
               </span>
               <span className="font-label-sm text-label-sm text-on-surface-variant">
-                Cluster Admin
+                {activeOperator.role}
               </span>
             </div>
           </div>
           <div className="w-7 h-7 rounded-full bg-primary flex items-center justify-center shrink-0">
             <span className="material-symbols-outlined text-on-primary text-[16px]">
-              person
+              {profileOpen ? 'expand_more' : 'unfold_more'}
             </span>
           </div>
-        </div>
+        </button>
       </div>
     </aside>
   );

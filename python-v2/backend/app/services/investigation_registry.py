@@ -256,6 +256,7 @@ async def run_investigation_task(
     use_llm: bool = True,
     bridge: Optional[Any] = None,
     pipeline_factory: Optional[Any] = None,
+    allow_best_effort: bool = False,
 ) -> None:
     """
     Background worker task executing the Agentic Investigation Pipeline asynchronously.
@@ -282,7 +283,11 @@ async def run_investigation_task(
             pipeline = pipeline_factory()
         else:
             model_name = os.environ.get("GEMINI_MODEL", "gemini-3.8-flash")
-            pipeline = InvestigationPipeline(bridge=bridge, model_name=model_name)
+            pipeline = InvestigationPipeline(
+                bridge=bridge,
+                model_name=model_name,
+                allow_best_effort=allow_best_effort,
+            )
 
         result: InvestigationResult = await pipeline.execute(request=req, use_llm=use_llm)
         duration_s = asyncio.get_event_loop().time() - t0

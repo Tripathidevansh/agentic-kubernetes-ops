@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useEffect, useState } from 'react';
 import { DiffViewer } from '../components/DiffViewer';
 import {
   InvestigationDetailResponse,
@@ -13,6 +13,7 @@ interface InvestigationViewProps {
   onOpenApproveModal: (proposal: RemediationProposal) => void;
   onOpenRejectModal: (proposal: RemediationProposal) => void;
   isLoading: boolean;
+  isGuest?: boolean;
 }
 
 export const InvestigationView: React.FC<InvestigationViewProps> = ({
@@ -23,8 +24,13 @@ export const InvestigationView: React.FC<InvestigationViewProps> = ({
   onOpenApproveModal,
   onOpenRejectModal,
   isLoading,
+  isGuest = false,
 }) => {
   const [selectedProposalIndex, setSelectedProposalIndex] = useState(0);
+
+  useEffect(() => {
+    setSelectedProposalIndex(0);
+  }, [investigation?.investigation_id]);
 
   if (isLoading && !investigation) {
     return (
@@ -430,12 +436,53 @@ export const InvestigationView: React.FC<InvestigationViewProps> = ({
               targetKind={currentProposal.target_kind}
               targetName={currentProposal.target_name}
             />
+          ) : currentProposal ? (
+            <div className="bg-surface-container-low rounded-lg p-space-md shadow-sm border border-surface-container-high space-y-3">
+              <div className="flex flex-wrap items-center justify-between gap-2 border-b border-surface-container-high pb-2 font-mono text-xs">
+                <div className="flex items-center gap-2">
+                  <span className="material-symbols-outlined text-[#F59E0B] text-[18px]">shield</span>
+                  <span className="font-bold text-on-surface">
+                    {currentProposal.target_kind}/{currentProposal.target_name || currentProposal.target_workload}
+                  </span>
+                </div>
+                <div className="flex items-center gap-2">
+                  <span className="px-2 py-0.5 rounded bg-[#F59E0B]/15 text-[#F59E0B] border border-[#F59E0B]/30 text-[10px] font-bold">
+                    {currentProposal.status}
+                  </span>
+                  <span className="px-2 py-0.5 rounded bg-surface-container text-outline text-[10px]">
+                    Risk: {currentProposal.risk_level}
+                  </span>
+                </div>
+              </div>
+
+              <div className="p-3 rounded bg-[#F59E0B]/10 border border-[#F59E0B]/30 text-xs space-y-1.5">
+                <div className="font-mono font-bold text-[#F59E0B] text-[11px] uppercase">
+                  Automated Patch Withheld (Safe GitOps Guardrail)
+                </div>
+                <p className="text-on-surface leading-relaxed">
+                  {currentProposal.insufficient_evidence_reason ||
+                    currentProposal.justification ||
+                    'Insufficient evidence to safely formulate an automated declarative patch.'}
+                </p>
+              </div>
+
+              {currentProposal.justification && (
+                <div className="p-3 rounded bg-surface-container border border-surface-container-high text-xs space-y-1">
+                  <span className="font-mono text-[10px] uppercase text-outline block">
+                    Technical Justification
+                  </span>
+                  <p className="text-on-surface-variant leading-relaxed">
+                    {currentProposal.justification}
+                  </p>
+                </div>
+              )}
+            </div>
           ) : (
             <div className="bg-surface-container-low rounded-lg p-space-md shadow-sm border border-surface-container-high text-center py-12 text-on-surface-variant font-mono text-xs">
               <span className="material-symbols-outlined text-3xl text-outline mb-2 block">
                 difference
               </span>
-              <span>No manifest diff available for selected proposal.</span>
+              <span>No proposals available for this investigation.</span>
             </div>
           )}
 
@@ -450,13 +497,16 @@ export const InvestigationView: React.FC<InvestigationViewProps> = ({
                 <div>
                   <span className="text-outline">Target Pod Phase: </span>
                   <span className="text-on-surface font-bold">
-                    {currentProposal.verification_plan.target_pod_phase || 'Running'}
+                    {currentProposal.verification_plan.target_phase ||
+                      currentProposal.verification_plan.target_pod_phase ||
+                      'Running'}
                   </span>
                 </div>
                 <div>
-                  <span className="text-outline">Readiness Probe Delay: </span>
+                  <span className="text-outline">Check Interval / Timeout: </span>
                   <span className="text-on-surface font-bold">
-                    {currentProposal.verification_plan.readiness_probe_initial_delay_seconds ?? 15}s
+                    {currentProposal.verification_plan.check_interval_seconds ?? 5}s /{' '}
+                    {currentProposal.verification_plan.timeout_seconds ?? 60}s
                   </span>
                 </div>
               </div>
@@ -506,21 +556,31 @@ export const InvestigationView: React.FC<InvestigationViewProps> = ({
                   </span>
                   <span>{gemini_metrics.length} call(s)</span>
                 </div>
-                {gemini_metrics.map((m, idx) => (
-                  <div
-                    key={idx}
-                    className="p-1.5 bg-surface-container-highest rounded text-[11px] space-y-0.5"
-                  >
-                    <div className="flex justify-between">
-                      <span className="text-on-surface font-semibold">{m.stage}</span>
-                      <span className="text-tertiary">{m.latency_seconds?.toFixed(2)}s</span>
+                {gemini_metrics.map((m, idx) => {
+                  const durSec =
+                    m.duration_ms != null
+                      ? (m.duration_ms / 1000).toFixed(2)
+                      : m.latency_seconds != null
+                      ? m.latency_seconds.toFixed(2)
+                      : '—';
+                  const statusLabel =
+                    m.status_code ?? m.http_status_code ?? (m.success ? 'OK (200)' : m.error_type || 'ERROR');
+                  return (
+                    <div
+                      key={idx}
+                      className="p-1.5 bg-surface-container-highest rounded text-[11px] space-y-0.5"
+                    >
+                      <div className="flex justify-between">
+                        <span className="text-on-surface font-semibold">{m.stage}</span>
+                        <span className="text-tertiary">{durSec}s</span>
+                      </div>
+                      <div className="flex justify-between text-outline text-[10px]">
+                        <span>HTTP Status: {statusLabel}</span>
+                        <span>{m.fallback_triggered ? 'Fallback Triggered' : m.model || 'Gemini'}</span>
+                      </div>
                     </div>
-                    <div className="flex justify-between text-outline text-[10px]">
-                      <span>HTTP Status: {m.http_status_code ?? 'OK (200)'}</span>
-                      <span>Tokens: {m.total_tokens ?? 'N/A'}</span>
-                    </div>
-                  </div>
-                ))}
+                  );
+                })}
               </div>
             )}
 
@@ -543,7 +603,11 @@ export const InvestigationView: React.FC<InvestigationViewProps> = ({
                       <div className="flex justify-between items-center">
                         <span className="text-[#818CF8] font-bold">{trace.tool_name}</span>
                         <span className="text-tertiary text-[10px]">
-                          {trace.duration_seconds ? `${(trace.duration_seconds * 1000).toFixed(0)}ms` : ''}
+                          {trace.duration_ms != null
+                            ? `${trace.duration_ms.toFixed(0)}ms`
+                            : trace.duration_seconds
+                            ? `${(trace.duration_seconds * 1000).toFixed(0)}ms`
+                            : ''}
                         </span>
                       </div>
                       <div className="text-on-surface-variant text-[11px] truncate">
@@ -570,7 +634,7 @@ export const InvestigationView: React.FC<InvestigationViewProps> = ({
             {/* Approval / Rejection Action Buttons */}
             {currentProposal && (
               <div className="space-y-2">
-                {currentProposal.approval ? (
+                {currentProposal.approval && currentProposal.approval.status !== 'PENDING' ? (
                   <div
                     className={`p-2.5 rounded font-mono text-xs border flex items-center justify-between ${
                       currentProposal.approval.status === 'APPROVED'
@@ -583,7 +647,7 @@ export const InvestigationView: React.FC<InvestigationViewProps> = ({
                         {currentProposal.approval.status === 'APPROVED' ? 'check_circle' : 'cancel'}
                       </span>
                       <span className="font-bold">
-                        {currentProposal.approval.status}: {currentProposal.approval.reviewer}
+                        {currentProposal.approval.status}: {currentProposal.approval.reviewer || 'operator'}
                       </span>
                     </div>
                     <span className="text-[10px] opacity-75">
@@ -594,15 +658,24 @@ export const InvestigationView: React.FC<InvestigationViewProps> = ({
                   <div className="flex items-center gap-space-xs">
                     <button
                       onClick={() => onOpenApproveModal(currentProposal)}
-                      disabled={!currentProposal.can_remediate}
-                      className="flex-1 flex items-center justify-center gap-1 py-2 px-3 rounded bg-primary-container text-on-primary-container font-headline-sm text-headline-sm font-semibold hover:bg-primary transition-colors shadow-sm disabled:opacity-40"
+                      disabled={isGuest || !currentProposal.can_remediate}
+                      title={
+                        isGuest
+                          ? 'Guest mode: switch to a Cluster Admin profile to approve'
+                          : currentProposal.can_remediate
+                          ? 'Approve this remediation proposal'
+                          : 'Approval disabled: automated patch withheld for safety'
+                      }
+                      className="flex-1 flex items-center justify-center gap-1 py-2 px-3 rounded bg-primary-container text-on-primary-container font-headline-sm text-headline-sm font-semibold hover:bg-primary transition-colors shadow-sm disabled:opacity-40 disabled:cursor-not-allowed"
                     >
                       <span className="material-symbols-outlined text-[16px]">check</span>
                       <span>Approve Remediation</span>
                     </button>
                     <button
                       onClick={() => onOpenRejectModal(currentProposal)}
-                      className="flex items-center justify-center gap-1 py-2 px-3 rounded bg-surface-container hover:bg-error-container hover:text-on-error-container text-on-surface font-headline-sm text-headline-sm transition-colors border border-surface-container-high"
+                      disabled={isGuest}
+                      title={isGuest ? 'Guest mode: switch to a Cluster Admin profile to reject' : undefined}
+                      className="flex items-center justify-center gap-1 py-2 px-3 rounded bg-surface-container hover:bg-error-container hover:text-on-error-container text-on-surface font-headline-sm text-headline-sm transition-colors border border-surface-container-high disabled:opacity-40 disabled:cursor-not-allowed"
                     >
                       <span className="material-symbols-outlined text-[16px]">close</span>
                       <span>Reject</span>

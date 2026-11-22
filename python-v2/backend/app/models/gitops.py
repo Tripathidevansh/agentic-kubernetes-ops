@@ -18,6 +18,7 @@ class GitOpsStatus(str, Enum):
     PENDING_APPROVAL = "PENDING_APPROVAL"
     READY_FOR_PREPARATION = "READY_FOR_PREPARATION"
     BRANCH_PREPARED = "BRANCH_PREPARED"
+    PR_OPENED = "PR_OPENED"
     REJECTED = "REJECTED"
     FAILED = "FAILED"
 
@@ -96,5 +97,7 @@ class GitOpsChangeRecord(BaseModel):
     operator: str = Field(default="operator")
     created_at: str = Field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
     prepared_at: Optional[str] = Field(default=None)
+    pr_url: Optional[str] = Field(default=None, description="Opened GitHub Pull Request URL")
+    pr_number: Optional[int] = Field(default=None, description="Opened GitHub Pull Request number")
     audit_events: List[GitOpsAuditEvent] = Field(default_factory=list)
     error: Optional[str] = Field(default=None)

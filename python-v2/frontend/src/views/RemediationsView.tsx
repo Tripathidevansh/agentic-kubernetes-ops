@@ -1,9 +1,12 @@
-import React, { useState } from 'react';
+import React, { useEffect, useState } from 'react';
 import { DiffViewer } from '../components/DiffViewer';
-import { RemediationProposal } from '../types/api';
+import { api } from '../services/api';
+import { GitOpsChangeRecord, GitOpsPreviewResponse, RemediationProposal } from '../types/api';
 
 interface RemediationsViewProps {
   proposals: RemediationProposal[];
+  operatorName?: string;
+  isGuest?: boolean;
   onOpenApproveModal: (proposal: RemediationProposal) => void;
   onOpenRejectModal: (proposal: RemediationProposal) => void;
   onOpenNewInvestigation: () => void;
@@ -11,6 +14,8 @@ interface RemediationsViewProps {
 
 export const RemediationsView: React.FC<RemediationsViewProps> = ({
   proposals,
+  operatorName = 'Devansh (Cluster Admin)',
+  isGuest = false,
   onOpenApproveModal,
   onOpenRejectModal,
   onOpenNewInvestigation,
@@ -29,6 +34,74 @@ export const RemediationsView: React.FC<RemediationsViewProps> = ({
   const [selectedProposalId, setSelectedProposalId] = useState<string | null>(
     proposals.length > 0 ? proposals[0].proposal_id : null
   );
+  const [gitopsPreview, setGitopsPreview] = useState<Record<string, GitOpsPreviewResponse>>({});
+  const [gitopsRecord, setGitopsRecord] = useState<Record<string, GitOpsChangeRecord>>({});
+  const [gitopsError, setGitopsError] = useState<Record<string, string>>({});
+  const [gitopsLoading, setGitopsLoading] = useState<string | null>(null);
+
+  useEffect(() => {
+    api
+      .listGitOpsChanges()
+      .then((records) => {
+        if (!Array.isArray(records)) return;
+        const map: Record<string, GitOpsChangeRecord> = {};
+        records.forEach((r) => {
+          map[r.proposal_id] = r;
+        });
+        setGitopsRecord((prev) => ({ ...map, ...prev }));
+      })
+      .catch(() => {
+        // Ignore if backend is offline
+      });
+  }, []);
+
+  const handlePreviewGitOps = async (proposalId: string) => {
+    setGitopsLoading(proposalId);
+    setGitopsError((prev) => ({ ...prev, [proposalId]: '' }));
+    try {
+      const preview = await api.previewGitOps(proposalId, operatorName);
+      setGitopsPreview((prev) => ({ ...prev, [proposalId]: preview }));
+    } catch (err) {
+      setGitopsError((prev) => ({
+        ...prev,
+        [proposalId]: err instanceof Error ? err.message : String(err),
+      }));
+    } finally {
+      setGitopsLoading(null);
+    }
+  };
+
+  const handlePrepareGitOps = async (proposalId: string) => {
+    setGitopsLoading(proposalId);
+    setGitopsError((prev) => ({ ...prev, [proposalId]: '' }));
+    try {
+      const record = await api.prepareGitOps(proposalId, operatorName);
+      setGitopsRecord((prev) => ({ ...prev, [proposalId]: record }));
+    } catch (err) {
+      setGitopsError((prev) => ({
+        ...prev,
+        [proposalId]: err instanceof Error ? err.message : String(err),
+      }));
+    } finally {
+      setGitopsLoading(null);
+    }
+  };
+
+  const handleCreateGitOpsPR = async (proposalId: string, changeId: string) => {
+    setGitopsLoading(proposalId);
+    setGitopsError((prev) => ({ ...prev, [proposalId]: '' }));
+    try {
+      const updated = await api.createGitOpsPR(changeId);
+      setGitopsRecord((prev) => ({ ...prev, [proposalId]: updated }));
+    } catch (err) {
+      setGitopsError((prev) => ({
+        ...prev,
+        [proposalId]: err instanceof Error ? err.message : String(err),
+      }));
+    } finally {
+      setGitopsLoading(null);
+    }
+  };
 
   const filteredProposals = proposals.filter((p) => {
     if (statusFilter === 'ALL') return true;
@@ -301,32 +374,136 @@ export const RemediationsView: React.FC<RemediationsViewProps> = ({
                 )}
 
                 {/* Approval Decision Controls */}
-                <div className="pt-2 border-t border-surface-container-high flex items-center justify-between">
+                <div className="pt-2 border-t border-surface-container-high space-y-2">
                   {activeProposal.approval && activeProposal.approval.status !== 'PENDING' ? (
-                    <div className={`text-xs font-mono flex items-center gap-1.5 ${
-                      activeProposal.approval.status === 'APPROVED' ? 'text-tertiary' : 'text-error'
-                    }`}>
-                      <span className="material-symbols-outlined text-[16px]">
-                        {activeProposal.approval.status === 'APPROVED' ? 'verified' : 'cancel'}
-                      </span>
-                      <span>
-                        Decision: <strong>{activeProposal.approval.status}</strong> by{' '}
-                        {activeProposal.approval.reviewer || 'operator'}
-                        {activeProposal.approval.comments ? ` (${activeProposal.approval.comments})` : ''}
-                      </span>
+                    <div className="space-y-2">
+                      <div className={`text-xs font-mono flex items-center gap-1.5 ${
+                        activeProposal.approval.status === 'APPROVED' ? 'text-tertiary' : 'text-error'
+                      }`}>
+                        <span className="material-symbols-outlined text-[16px]">
+                          {activeProposal.approval.status === 'APPROVED' ? 'verified' : 'cancel'}
+                        </span>
+                        <span>
+                          Decision: <strong>{activeProposal.approval.status}</strong> by{' '}
+                          {activeProposal.approval.reviewer || 'operator'}
+                          {activeProposal.approval.comments ? ` (${activeProposal.approval.comments})` : ''}
+                        </span>
+                      </div>
+
+                      {activeProposal.approval.status === 'APPROVED' && (
+                        <div className="p-2.5 bg-surface-container rounded border border-surface-container-high space-y-2">
+                          <div className="flex flex-wrap items-center gap-2">
+                            <button
+                              type="button"
+                              onClick={() => handlePreviewGitOps(activeProposal.proposal_id)}
+                              disabled={gitopsLoading === activeProposal.proposal_id}
+                              className="flex items-center gap-1.5 px-3 py-1.5 rounded bg-surface-container-high hover:bg-surface-container-highest text-on-surface font-mono text-xs border border-outline-variant/40 transition-colors disabled:opacity-50"
+                            >
+                              <span className="material-symbols-outlined text-[15px] text-primary">preview</span>
+                              <span>Preview GitOps Diff</span>
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => handlePrepareGitOps(activeProposal.proposal_id)}
+                              disabled={
+                                isGuest ||
+                                gitopsLoading === activeProposal.proposal_id ||
+                                Boolean(gitopsRecord[activeProposal.proposal_id])
+                              }
+                              title={isGuest ? 'Guest mode: switch to a Cluster Admin profile to prepare Git branches' : undefined}
+                              className="flex items-center gap-1.5 px-3 py-1.5 rounded bg-primary-container text-on-primary-container hover:bg-primary font-mono text-xs font-semibold transition-colors disabled:opacity-50 disabled:cursor-not-allowed"
+                            >
+                              <span className="material-symbols-outlined text-[15px]">alt_route</span>
+                              <span>
+                                {gitopsRecord[activeProposal.proposal_id]
+                                  ? 'Local Branch Prepared'
+                                  : 'Prepare Local GitOps Branch'}
+                              </span>
+                            </button>
+                          </div>
+
+                          {gitopsError[activeProposal.proposal_id] && (
+                            <div className="p-2 rounded bg-error/10 border border-error/30 text-error font-mono text-[11px]">
+                              {gitopsError[activeProposal.proposal_id]}
+                            </div>
+                          )}
+
+                          {gitopsPreview[activeProposal.proposal_id] && !gitopsRecord[activeProposal.proposal_id] && (
+                            <div className="p-2 rounded bg-surface-container-lowest border border-primary/30 font-mono text-[11px] space-y-1 text-on-surface-variant">
+                              <div className="text-primary font-bold">
+                                GitOps Preview: {gitopsPreview[activeProposal.proposal_id].target_file}
+                              </div>
+                              <div>
+                                Image: {gitopsPreview[activeProposal.proposal_id].current_image} →{' '}
+                                <span className="text-tertiary font-bold">
+                                  {gitopsPreview[activeProposal.proposal_id].replacement_image}
+                                </span>
+                              </div>
+                            </div>
+                          )}
+
+                          {gitopsRecord[activeProposal.proposal_id] && (
+                            <div className="p-2 rounded bg-tertiary/10 border border-tertiary/30 font-mono text-[11px] space-y-1.5 text-on-surface">
+                              <div className="text-tertiary font-bold flex items-center gap-1">
+                                <span className="material-symbols-outlined text-[14px]">check_circle</span>
+                                <span>
+                                  {gitopsRecord[activeProposal.proposal_id].pr_url
+                                    ? 'GitHub Pull Request Opened'
+                                    : 'Local GitOps Branch Prepared (Ready for PR)'}
+                                </span>
+                              </div>
+                              <div>Branch: {gitopsRecord[activeProposal.proposal_id].branch_name}</div>
+                              <div>Commit: {gitopsRecord[activeProposal.proposal_id].commit_hash}</div>
+                              {gitopsRecord[activeProposal.proposal_id].pr_url ? (
+                                <a
+                                  href={gitopsRecord[activeProposal.proposal_id].pr_url!}
+                                  target="_blank"
+                                  rel="noreferrer"
+                                  className="inline-flex items-center gap-1 px-2.5 py-1 rounded bg-primary-container text-on-primary-container font-semibold hover:bg-primary transition-colors mt-1"
+                                >
+                                  <span className="material-symbols-outlined text-[14px]">open_in_new</span>
+                                  <span>
+                                    View Pull Request #{gitopsRecord[activeProposal.proposal_id].pr_number}
+                                  </span>
+                                </a>
+                              ) : (
+                                <button
+                                  type="button"
+                                  onClick={() =>
+                                    handleCreateGitOpsPR(
+                                      activeProposal.proposal_id,
+                                      gitopsRecord[activeProposal.proposal_id].change_id
+                                    )
+                                  }
+                                  disabled={isGuest || gitopsLoading === activeProposal.proposal_id}
+                                  title={isGuest ? 'Guest mode: switch to a Cluster Admin profile to create GitHub PRs' : undefined}
+                                  className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded bg-primary-container text-on-primary-container hover:bg-primary font-mono text-xs font-semibold transition-colors disabled:opacity-50 disabled:cursor-not-allowed mt-1"
+                                >
+                                  <span className="material-symbols-outlined text-[15px]">call_made</span>
+                                  <span>Create GitHub PR</span>
+                                </button>
+                              )}
+                            </div>
+                          )}
+                        </div>
+                      )}
                     </div>
                   ) : activeProposal.can_remediate && activeProposal.status === 'ACTIONABLE' ? (
                     <div className="flex items-center gap-2 w-full">
                       <button
                         onClick={() => onOpenApproveModal(activeProposal)}
-                        className="flex-1 flex items-center justify-center gap-1.5 py-1.5 px-3 rounded bg-primary-container text-on-primary-container font-headline-sm text-headline-sm font-semibold hover:bg-primary transition-colors shadow-sm"
+                        disabled={isGuest}
+                        title={isGuest ? 'Guest mode: switch to a Cluster Admin profile to approve' : undefined}
+                        className="flex-1 flex items-center justify-center gap-1.5 py-1.5 px-3 rounded bg-primary-container text-on-primary-container font-headline-sm text-headline-sm font-semibold hover:bg-primary transition-colors shadow-sm disabled:opacity-40 disabled:cursor-not-allowed"
                       >
                         <span className="material-symbols-outlined text-[16px]">check</span>
                         <span>Approve Remediation (Stage GitOps)</span>
                       </button>
                       <button
                         onClick={() => onOpenRejectModal(activeProposal)}
-                        className="py-1.5 px-3 rounded bg-surface-container hover:bg-error-container hover:text-on-error-container text-on-surface font-headline-sm text-headline-sm transition-colors border border-surface-container-high"
+                        disabled={isGuest}
+                        title={isGuest ? 'Guest mode: switch to a Cluster Admin profile to reject' : undefined}
+                        className="py-1.5 px-3 rounded bg-surface-container hover:bg-error-container hover:text-on-error-container text-on-surface font-headline-sm text-headline-sm transition-colors border border-surface-container-high disabled:opacity-40 disabled:cursor-not-allowed"
                       >
                         <span className="material-symbols-outlined text-[16px]">close</span>
                         <span>Reject</span>

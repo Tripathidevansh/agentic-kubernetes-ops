@@ -87,19 +87,22 @@ export const VerificationView: React.FC<VerificationViewProps> = ({
                       Target Pod Phase
                     </span>
                     <span className="text-on-surface font-bold text-sm">
-                      {plan?.target_pod_phase || 'Running'}
+                      {plan?.target_phase || plan?.target_pod_phase || 'Running'}
                     </span>
                     <span className="text-[10px] text-outline block">
-                      Readiness: {plan?.expected_ready_condition ? 'true' : 'true'}
+                      Expected Conditions:{' '}
+                      {plan?.expected_conditions?.length
+                        ? plan.expected_conditions.map((c) => `${c.type}=${c.status}`).join(', ')
+                        : 'Ready=True'}
                     </span>
                   </div>
 
                   <div className="p-space-sm bg-surface-container rounded border border-surface-container-high font-mono text-xs space-y-1">
                     <span className="text-outline text-[11px] uppercase block">
-                      Probe Tolerance Window
+                      Probe Check Window
                     </span>
                     <span className="text-primary font-bold text-sm">
-                      {plan?.readiness_probe_initial_delay_seconds ?? 15}s initial delay
+                      {plan?.check_interval_seconds ?? 5}s check interval
                     </span>
                     <span className="text-[10px] text-outline block">
                       Timeout: {plan?.timeout_seconds ?? 60}s

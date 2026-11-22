@@ -2,7 +2,7 @@ import React, { useEffect, useRef, useState } from 'react';
 import { ApprovalModal } from './components/ApprovalModal';
 import { Header } from './components/Header';
 import { NewInvestigationModal } from './components/NewInvestigationModal';
-import { NavTab, Sidebar } from './components/Sidebar';
+import { NavTab, OPERATOR_PROFILES, OperatorProfile, Sidebar } from './components/Sidebar';
 import { api } from './services/api';
 import {
   ClusterOverviewResponse,
@@ -24,6 +24,7 @@ export const App: React.FC = () => {
   // Navigation & UI state
   const [activeTab, setActiveTab] = useState<NavTab>('overview');
   const [namespace, setNamespace] = useState<string>('k8s-agent-demo');
+  const [activeOperator, setActiveOperator] = useState<OperatorProfile>(OPERATOR_PROFILES[0]);
   const [isRefreshing, setIsRefreshing] = useState(false);
   const [lastUpdated, setLastUpdated] = useState<number>(0);
 
@@ -102,10 +103,19 @@ export const App: React.FC = () => {
         if (isMounted) {
           setCurrentInvestigation(data);
 
-          // If still running/queued, poll
+          // If still running/queued, poll; once done, refresh proposals & investigations list
           if (data.status === 'RUNNING' || data.status === 'QUEUED') {
             if (pollTimerRef.current) clearTimeout(pollTimerRef.current);
             pollTimerRef.current = window.setTimeout(fetchInvestigation, 3000);
+          } else {
+            Promise.allSettled([api.listInvestigations(), api.listRemediations()]).then(([invs, rems]) => {
+              if (!isMounted) return;
+              if (invs.status === 'fulfilled') setInvestigationsList(invs.value);
+              if (rems.status === 'fulfilled') {
+                const list = Array.isArray(rems.value) ? rems.value : ((rems.value as any)?.remediations || []);
+                setAllProposals(list);
+              }
+            });
           }
         }
       } catch (err) {
@@ -198,6 +208,11 @@ export const App: React.FC = () => {
   const availablePods = overview?.pods?.map((p) => p.name) || [];
   const proposalsForVerification =
     currentInvestigation?.result?.remediation_proposals || allProposals;
+  const isClusterConnected = health?.cluster_connected ?? health?.kubernetes_connected ?? true;
+  const activeModel = health?.model || health?.gemini_model || 'gemini-3.8-flash';
+  const availableNamespaces = Array.from(
+    new Set([namespace, ...(overview?.namespaces || []), 'k8s-agent-demo', 'default'])
+  );
 
   return (
     <div className="flex bg-surface min-h-screen text-on-surface antialiased font-sans">
@@ -207,7 +222,9 @@ export const App: React.FC = () => {
         onSelectTab={setActiveTab}
         incidentCount={incidents.length}
         remediationCount={allProposals.filter((p) => p.can_remediate && (p.approval?.status === 'PENDING' || !p.approval)).length}
-        clusterConnected={health?.kubernetes_connected ?? true}
+        clusterConnected={isClusterConnected}
+        activeOperator={activeOperator}
+        onSelectOperator={setActiveOperator}
       />
 
       {/* Main View Area (offset left by sidebar width 60 = 240px) */}
@@ -216,12 +233,14 @@ export const App: React.FC = () => {
         <Header
           namespace={namespace}
           onSelectNamespace={setNamespace}
-          availableNamespaces={overview?.namespaces || [namespace]}
-          geminiModel={health?.gemini_model || 'gemini-3.8-flash'}
+          availableNamespaces={availableNamespaces}
+          geminiModel={activeModel}
           isRefreshing={isRefreshing}
           onRefresh={loadData}
           onOpenNewInvestigation={() => setIsNewInvestigationOpen(true)}
           lastUpdatedSeconds={lastUpdated}
+          incidentCount={incidents.length}
+          onOpenIncidents={() => setActiveTab('incidents')}
         />
 
         {/* Content View Router */}
@@ -230,7 +249,8 @@ export const App: React.FC = () => {
             <OverviewView
               overview={overview}
               incidents={incidents}
-              geminiModel={health?.gemini_model || 'gemini-3.8-flash'}
+              geminiModel={activeModel}
+              operatorName={activeOperator.name}
               onInvestigatePod={handleInvestigatePod}
               onViewAllIncidents={() => setActiveTab('incidents')}
               onOpenNewInvestigation={() => setIsNewInvestigationOpen(true)}
@@ -261,12 +281,15 @@ export const App: React.FC = () => {
                 setModalAction('reject');
               }}
               isLoading={isLoadingInvestigation}
+              isGuest={activeOperator.isGuest}
             />
           )}
 
           {activeTab === 'remediations' && (
             <RemediationsView
               proposals={allProposals}
+              operatorName={`${activeOperator.name} (${activeOperator.role})`}
+              isGuest={activeOperator.isGuest}
               onOpenApproveModal={(proposal) => {
                 setModalProposal(proposal);
                 setModalAction('approve');
@@ -290,7 +313,7 @@ export const App: React.FC = () => {
           {activeTab === 'observability' && (
             <ObservabilityView
               investigation={currentInvestigation}
-              geminiModel={health?.gemini_model || 'gemini-3.8-flash'}
+              geminiModel={activeModel}
             />
           )}
 
@@ -323,6 +346,7 @@ export const App: React.FC = () => {
       <ApprovalModal
         proposal={modalProposal}
         action={modalAction}
+        defaultReviewer={`${activeOperator.name} (${activeOperator.role})`}
         onClose={() => {
           setModalProposal(null);
           setModalAction(null);

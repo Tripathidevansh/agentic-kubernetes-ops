@@ -330,6 +330,7 @@ def validate_remediation_proposal(
     deterministic_diagnoses: List[Dict[str, Any]],
     observed_pod_names: List[str],
     pod_evidence: Optional[Dict[str, Any]] = None,
+    allow_best_effort: bool = False,
 ) -> None:
     """
     Validate that a proposed remediation is safe, grounded, addresses root cause,
@@ -369,8 +370,9 @@ def validate_remediation_proposal(
         if not proposal.patch or not proposal.patch.diff:
             raise SafetyViolationError("Actionable proposal must contain a non-empty YAML patch diff.")
 
-        # Check for masking commands (sleep 3600, true, etc.)
-        validate_no_masking_commands(proposal.patch.diff, proposal.patch.patch_content)
+        # Check for masking commands (sleep 3600, true, etc.) unless best-effort operator-reviewed mode
+        if not allow_best_effort:
+            validate_no_masking_commands(proposal.patch.diff, proposal.patch.patch_content)
 
         # Correlate with corresponding diagnosis to verify root-cause alignment
         matching_diags = [
@@ -378,8 +380,9 @@ def validate_remediation_proposal(
             if d.get("pod") == proposal.target_workload or d.get("resource_name", "").startswith(proposal.target_workload)
         ]
         if matching_diags:
-            validate_root_cause_alignment(proposal, matching_diags[0])
-            validate_resource_sizing_grounding(proposal, matching_diags[0], pod_evidence)
+            if not allow_best_effort:
+                validate_root_cause_alignment(proposal, matching_diags[0])
+                validate_resource_sizing_grounding(proposal, matching_diags[0], pod_evidence)
 
         # Validate controller ownership
         if pod_evidence:

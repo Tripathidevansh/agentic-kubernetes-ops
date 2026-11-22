@@ -8,6 +8,7 @@ pipeline, status polling, and verification plan inspection.
 import asyncio
 from datetime import datetime, timezone
 import logging
+import os
 from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, BackgroundTasks, HTTPException, status
@@ -60,12 +61,14 @@ async def create_investigation(
     )
 
     # Dispatch to background task runner
+    allow_best_effort = os.environ.get("ALLOW_BEST_EFFORT_REMEDIATIONS", "").strip().lower() == "true"
     background_tasks.add_task(
         run_investigation_task,
         investigation_id=record.investigation_id,
         namespace=body.namespace,
         target_pod=body.pod_name,
         use_llm=body.use_llm,
+        allow_best_effort=allow_best_effort,
     )
 
     return InvestigationCreateResponse(

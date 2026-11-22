@@ -15,7 +15,10 @@ export const ObservabilityView: React.FC<ObservabilityViewProps> = ({
 
   const totalGeminiCalls = geminiMetrics.length;
   const totalTokens = geminiMetrics.reduce((sum, m) => sum + (m.total_tokens || 0), 0);
-  const totalGeminiLatency = geminiMetrics.reduce((sum, m) => sum + (m.latency_seconds || 0), 0);
+  const totalGeminiLatency = geminiMetrics.reduce(
+    (sum, m) => sum + (m.duration_ms != null ? m.duration_ms / 1000 : (m.latency_seconds || 0)),
+    0
+  );
   const avgLatency = totalGeminiCalls > 0 ? (totalGeminiLatency / totalGeminiCalls).toFixed(2) : '0.00';
 
   return (
@@ -130,13 +133,17 @@ export const ObservabilityView: React.FC<ObservabilityViewProps> = ({
                 <div className="flex justify-between items-center">
                   <div className="flex items-center gap-2">
                     <span className="px-1.5 py-0.5 rounded bg-surface-container-highest text-[#818CF8] font-bold">
-                      {trace.stage}
+                      {trace.agent_name || trace.stage || 'mcp'}
                     </span>
                     <span className="text-on-surface font-semibold">{trace.tool_name}</span>
                   </div>
                   <div className="flex items-center gap-2 text-[11px]">
                     <span className="text-tertiary">
-                      {trace.duration_seconds ? `${(trace.duration_seconds * 1000).toFixed(0)}ms` : ''}
+                      {trace.duration_ms != null
+                        ? `${trace.duration_ms.toFixed(0)}ms`
+                        : trace.duration_seconds
+                        ? `${(trace.duration_seconds * 1000).toFixed(0)}ms`
+                        : ''}
                     </span>
                     <span className="text-outline">{trace.timestamp?.slice(11, 19)}</span>
                   </div>

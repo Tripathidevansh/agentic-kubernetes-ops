@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useEffect, useState } from 'react';
 
 interface NewInvestigationModalProps {
   isOpen: boolean;
@@ -20,6 +20,13 @@ export const NewInvestigationModal: React.FC<NewInvestigationModalProps> = ({
   const [namespace, setNamespace] = useState(defaultNamespace);
   const [selectedPod, setSelectedPod] = useState('');
   const [useLlm, setUseLlm] = useState(true);
+
+  useEffect(() => {
+    if (isOpen) {
+      setNamespace(defaultNamespace);
+      setSelectedPod('');
+    }
+  }, [isOpen, defaultNamespace]);
 
   if (!isOpen) return null;
 

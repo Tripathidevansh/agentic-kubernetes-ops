@@ -46,12 +46,12 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
           </div>
           <span
             className={`px-2 py-0.5 rounded text-[10px] font-bold ${
-              health?.status === 'ok'
+              health?.status === 'healthy' || health?.status === 'ok'
                 ? 'bg-tertiary/20 text-tertiary'
                 : 'bg-error/20 text-error'
             }`}
           >
-            {health?.status === 'ok' ? 'HEALTHY (200 OK)' : 'DEGRADED'}
+            {health?.status === 'healthy' || health?.status === 'ok' ? 'HEALTHY (200 OK)' : 'DEGRADED'}
           </span>
         </div>
 
@@ -66,10 +66,12 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
             <span className="text-outline text-[11px] uppercase block">Kubernetes Connection</span>
             <span
               className={`font-bold text-sm ${
-                health?.kubernetes_connected ? 'text-tertiary' : 'text-error'
+                health?.cluster_connected ?? health?.kubernetes_connected ? 'text-tertiary' : 'text-error'
               }`}
             >
-              {health?.kubernetes_connected ? 'CONNECTED (In-Cluster/Kubeconfig)' : 'DISCONNECTED'}
+              {health?.cluster_connected ?? health?.kubernetes_connected
+                ? 'CONNECTED (In-Cluster/Kubeconfig)'
+                : 'DISCONNECTED'}
             </span>
             <span className="text-[10px] text-outline block">Read-only Telemetry</span>
           </div>
@@ -77,7 +79,7 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
           <div className="p-space-sm bg-surface-container rounded border border-surface-container-high space-y-1">
             <span className="text-outline text-[11px] uppercase block">Gemini Model</span>
             <span className="text-primary font-bold text-sm">
-              {health?.gemini_model || 'gemini-3.8-flash'}
+              {health?.model || health?.gemini_model || 'gemini-3.8-flash'}
             </span>
             <span className="text-[10px] text-outline block">Google ADK Runner</span>
           </div>
@@ -134,13 +136,13 @@ export const SettingsView: React.FC<SettingsViewProps> = ({
 
         <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 gap-2 font-mono text-xs pt-1">
           {[
-            { name: 'get_cluster_overview', desc: 'Cluster-wide pod tallies and health status' },
-            { name: 'get_pod_evidence', desc: 'Granular container exit codes and probes' },
-            { name: 'get_pod_logs', desc: 'Tail logs sanitized for token efficiency' },
-            { name: 'get_pod_events', desc: 'Recent K8s warning and scheduling events' },
-            { name: 'get_resource_config', desc: 'Owner controller and workload specs' },
-            { name: 'get_network_policies', desc: 'Ingress and egress policy topology' },
-            { name: 'get_node_metrics', desc: 'CPU/memory capacity and allocatables' },
+            { name: 'scan_cluster', desc: 'Cluster-wide pod tallies, states, and warning events' },
+            { name: 'get_pod_details', desc: 'Granular container exit codes, conditions, and probes' },
+            { name: 'get_pod_logs', desc: 'Current and previous container logs (tail limited)' },
+            { name: 'get_events', desc: 'Recent K8s warning and scheduling events' },
+            { name: 'run_diagnosis', desc: 'Authoritative deterministic 10-scenario diagnosis engine' },
+            { name: 'get_pvc_details', desc: 'PersistentVolumeClaim binding phase and storage class' },
+            { name: 'get_resource_config', desc: 'Images, CPU/memory limits, probes, and volume refs' },
           ].map((t) => (
             <div
               key={t.name}

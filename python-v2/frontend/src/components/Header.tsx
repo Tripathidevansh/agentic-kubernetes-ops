@@ -1,4 +1,4 @@
-import React from 'react';
+import React, { useState } from 'react';
 
 interface HeaderProps {
   namespace: string;
@@ -9,6 +9,8 @@ interface HeaderProps {
   onRefresh: () => void;
   onOpenNewInvestigation: () => void;
   lastUpdatedSeconds: number;
+  incidentCount?: number;
+  onOpenIncidents?: () => void;
 }
 
 export const Header: React.FC<HeaderProps> = ({
@@ -20,7 +22,11 @@ export const Header: React.FC<HeaderProps> = ({
   onRefresh,
   onOpenNewInvestigation,
   lastUpdatedSeconds,
+  incidentCount = 0,
+  onOpenIncidents,
 }) => {
+  const [nsOpen, setNsOpen] = useState(false);
+  const [notifOpen, setNotifOpen] = useState(false);
   return (
     <header className="fixed top-0 left-60 right-0 h-14 bg-surface-container-lowest/90 backdrop-blur-md z-40 px-gutter-desktop flex items-center justify-between shadow-[0_1px_8px_rgba(0,0,0,0.3)] border-b border-surface-container-high/30 select-none">
       {/* Left: Cluster & Namespace Breadcrumb */}
@@ -40,8 +46,15 @@ export const Header: React.FC<HeaderProps> = ({
       {/* Right Controls */}
       <div className="flex items-center gap-space-md">
         {/* Namespace Selector Dropdown */}
-        <div className="relative group">
-          <div className="flex items-center gap-space-xs px-space-sm py-1 bg-surface-container rounded cursor-pointer hover:bg-surface-container-high transition-colors">
+        <div className="relative">
+          <button
+            type="button"
+            onClick={() => {
+              setNsOpen((v) => !v);
+              setNotifOpen(false);
+            }}
+            className="flex items-center gap-space-xs px-space-sm py-1 bg-surface-container rounded cursor-pointer hover:bg-surface-container-high transition-colors"
+          >
             <span className="font-label-sm text-label-sm text-outline">NS:</span>
             <span className="font-code-block text-code-block text-on-surface font-semibold">
               {namespace}
@@ -49,13 +62,17 @@ export const Header: React.FC<HeaderProps> = ({
             <span className="material-symbols-outlined text-[16px] text-on-surface-variant">
               expand_more
             </span>
-          </div>
-          {availableNamespaces.length > 1 && (
-            <div className="absolute right-0 top-full mt-1 w-44 bg-surface-container-high border border-outline-variant rounded shadow-xl py-1 hidden group-hover:block z-50">
+          </button>
+          {nsOpen && (
+            <div className="absolute right-0 top-full mt-1 w-48 bg-surface-container-high border border-outline-variant rounded shadow-xl py-1 z-50">
               {availableNamespaces.map((ns) => (
                 <button
                   key={ns}
-                  onClick={() => onSelectNamespace(ns)}
+                  type="button"
+                  onClick={() => {
+                    onSelectNamespace(ns);
+                    setNsOpen(false);
+                  }}
                   className={`w-full text-left px-3 py-1.5 text-xs font-mono transition-colors ${
                     ns === namespace
                       ? 'text-primary bg-surface-container-highest font-bold'
@@ -96,14 +113,47 @@ export const Header: React.FC<HeaderProps> = ({
         </div>
 
         {/* Notifications */}
-        <button
-          className="relative p-1.5 text-on-surface-variant hover:text-on-surface rounded hover:bg-surface-container transition-colors"
-          type="button"
-          title="Cluster Notifications"
-        >
-          <span className="material-symbols-outlined text-[20px]">notifications</span>
-          <span className="absolute top-1 right-1 h-2 w-2 rounded-full bg-error" />
-        </button>
+        <div className="relative">
+          <button
+            onClick={() => {
+              setNotifOpen((v) => !v);
+              setNsOpen(false);
+            }}
+            className="relative p-1.5 text-on-surface-variant hover:text-on-surface rounded hover:bg-surface-container transition-colors"
+            type="button"
+            title="Cluster Notifications"
+          >
+            <span className="material-symbols-outlined text-[20px]">notifications</span>
+            {incidentCount > 0 && (
+              <span className="absolute top-1 right-1 h-2 w-2 rounded-full bg-error" />
+            )}
+          </button>
+          {notifOpen && (
+            <div className="absolute right-0 top-full mt-1 w-64 bg-surface-container-high border border-outline-variant rounded-lg shadow-xl p-3 z-50 space-y-2 font-mono text-xs">
+              <div className="font-bold text-on-surface flex items-center justify-between">
+                <span>Cluster Alerts</span>
+                <span className="text-error">{incidentCount} active</span>
+              </div>
+              <p className="text-on-surface-variant text-[11px]">
+                {incidentCount > 0
+                  ? `${incidentCount} incident(s) detected in namespace '${namespace}'.`
+                  : `All workloads healthy in '${namespace}'.`}
+              </p>
+              {onOpenIncidents && (
+                <button
+                  type="button"
+                  onClick={() => {
+                    onOpenIncidents();
+                    setNotifOpen(false);
+                  }}
+                  className="w-full py-1.5 rounded bg-primary-container text-on-primary-container font-semibold hover:bg-primary transition-colors text-[11px]"
+                >
+                  View Incidents
+                </button>
+              )}
+            </div>
+          )}
+        </div>
 
         {/* Primary Action: New Investigation */}
         <button

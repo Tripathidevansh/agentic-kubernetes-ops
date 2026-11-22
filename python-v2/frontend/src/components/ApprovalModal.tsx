@@ -1,9 +1,10 @@
-import React, { useState } from 'react';
+import React, { useEffect, useState } from 'react';
 import { RemediationProposal } from '../types/api';
 
 interface ApprovalModalProps {
   proposal: RemediationProposal | null;
   action: 'approve' | 'reject' | null;
+  defaultReviewer?: string;
   onClose: () => void;
   onConfirmApprove: (proposalId: string, reviewer: string, comments: string) => void;
   onConfirmReject: (proposalId: string, reviewer: string, reason: string) => void;
@@ -13,17 +14,23 @@ interface ApprovalModalProps {
 export const ApprovalModal: React.FC<ApprovalModalProps> = ({
   proposal,
   action,
+  defaultReviewer = 'Devansh (Cluster Admin)',
   onClose,
   onConfirmApprove,
   onConfirmReject,
   isSubmitting,
 }) => {
-  const [reviewer, setReviewer] = useState('Alex Vance (SRE Operator)');
-  const [note, setNote] = useState(
-    action === 'approve'
-      ? 'Verified root cause and memory limit increase against incident evidence.'
-      : 'Requires manual verification of cluster capacity before altering resource quotas.'
-  );
+  const [reviewer, setReviewer] = useState(defaultReviewer);
+  const [note, setNote] = useState('');
+
+  useEffect(() => {
+    setReviewer(defaultReviewer);
+    setNote(
+      action === 'approve'
+        ? 'Verified root cause and declarative manifest diff against incident evidence.'
+        : 'Requires manual verification before applying configuration change.'
+    );
+  }, [action, proposal?.proposal_id, defaultReviewer]);
 
   if (!proposal || !action) return null;
 
@@ -92,7 +99,7 @@ export const ApprovalModal: React.FC<ApprovalModalProps> = ({
               </span>
             </div>
             <p className="text-xs text-on-surface-variant pt-1 border-t border-surface-container-high/60">
-              {proposal.summary}
+              {proposal.justification || proposal.summary}
             </p>
           </div>
 

@@ -20,6 +20,7 @@ import re
 import subprocess
 from typing import Any, Dict, List, Optional, Tuple
 
+import httpx
 import yaml
 
 from app.models.gitops import (
@@ -80,7 +81,104 @@ DEFAULT_TRUSTED_TARGETS: Dict[Tuple[str, str, str], GitOpsTargetConfig] = {
         manifest_path="python-v2/manifests/gitops/controlled-imagepull.yaml",
         description="Controlled ImagePullBackOff scenario with verified alpine replacement image",
     ),
+    ("Deployment", "demo-app", "k8s-agent-demo"): GitOpsTargetConfig(
+        target_kind="Deployment",
+        target_name="demo-app",
+        target_namespace="k8s-agent-demo",
+        container_name="app",
+        current_image="nginx:this-image-does-not-exist",
+        trusted_replacement_image="nginx:1.27.0-alpine",
+        manifest_path="python-v2/manifests/scenarios/deployment.yaml",
+        description="Demo ImagePullBackOff deployment with verified alpine replacement image",
+    ),
 }
+
+# Scenario manifest paths for general declarative YAML patch remediation
+SCENARIO_MANIFEST_PATHS: Dict[Tuple[str, str, str], str] = {
+    ("Deployment", "crashloop-test", "k8s-agent-demo"): "python-v2/manifests/scenarios/crashloop-test.yaml",
+    ("Deployment", "oom-test", "k8s-agent-demo"): "python-v2/manifests/scenarios/oom-test.yaml",
+    ("Pod", "insufficient-cpu", "k8s-agent-demo"): "python-v2/manifests/scenarios/insufficient-cpu.yaml",
+    ("Pod", "invalid-startup-command", "k8s-agent-demo"): "python-v2/manifests/scenarios/invalid-startup-command.yaml",
+    ("Pod", "liveness-probe-failure", "k8s-agent-demo"): "python-v2/manifests/scenarios/liveness-probe-failure.yaml",
+    ("Pod", "missing-configmap", "k8s-agent-demo"): "python-v2/manifests/scenarios/missing-configmap.yaml",
+    ("Pod", "missing-secret", "k8s-agent-demo"): "python-v2/manifests/scenarios/missing-secret.yaml",
+    ("Pod", "readiness-probe-failure", "k8s-agent-demo"): "python-v2/manifests/scenarios/readiness-probe-failure.yaml",
+    ("Pod", "unbound-pvc-pod", "k8s-agent-demo"): "python-v2/manifests/scenarios/unbound-pvc.yaml",
+}
+
+
+def _deep_merge_k8s_patch(base: Any, patch: Any) -> Any:
+    """Deep-merge a Kubernetes strategic-style patch dict into a base manifest dict."""
+    if not isinstance(base, dict) or not isinstance(patch, dict):
+        return patch
+
+    result = dict(base)
+    for key, val in patch.items():
+        if key == "containers" and isinstance(val, list) and isinstance(result.get("containers"), list):
+            merged_containers = [dict(c) if isinstance(c, dict) else c for c in result["containers"]]
+            for p_c in val:
+                if not isinstance(p_c, dict):
+                    continue
+                p_name = p_c.get("name")
+                matched = False
+                for idx, b_c in enumerate(merged_containers):
+                    if isinstance(b_c, dict) and (not p_name or b_c.get("name") == p_name):
+                        merged_containers[idx] = _deep_merge_k8s_patch(b_c, p_c)
+                        matched = True
+                        break
+                if not matched:
+                    merged_containers.append(p_c)
+            result["containers"] = merged_containers
+        elif isinstance(val, dict) and isinstance(result.get(key), dict):
+            result[key] = _deep_merge_k8s_patch(result[key], val)
+        else:
+            result[key] = val
+    return result
+
+
+def safe_apply_yaml_patch(
+    original_yaml_content: str,
+    target_kind: str,
+    target_name: str,
+    patch_content: Dict[str, Any],
+) -> str:
+    """Apply a structured YAML patch to a Kubernetes manifest (supports multi-document YAML)."""
+    try:
+        docs = [d for d in yaml.safe_load_all(original_yaml_content) if d is not None]
+    except yaml.YAMLError as exc:
+        raise GitOpsManifestSyntaxError(f"Invalid YAML syntax in manifest: {exc}") from exc
+
+    if not docs:
+        raise GitOpsValidationError("Manifest file contains no YAML documents.")
+
+    updated_any = False
+    is_pvc_storage_patch = (
+        isinstance(patch_content, dict)
+        and isinstance(patch_content.get("spec"), dict)
+        and "storageClassName" in patch_content["spec"]
+    )
+
+    for idx, doc in enumerate(docs):
+        if not isinstance(doc, dict):
+            continue
+        d_kind = doc.get("kind")
+        d_name = (doc.get("metadata") or {}).get("name")
+        if is_pvc_storage_patch and d_kind == "PersistentVolumeClaim":
+            docs[idx] = _deep_merge_k8s_patch(doc, patch_content)
+            updated_any = True
+            break
+        if d_kind == target_kind and d_name == target_name:
+            docs[idx] = _deep_merge_k8s_patch(doc, patch_content)
+            updated_any = True
+            break
+
+    if not updated_any:
+        # Fallback: apply to the last document if kind/name matched loosely
+        docs[-1] = _deep_merge_k8s_patch(docs[-1], patch_content)
+
+    updated_yaml = yaml.safe_dump_all(docs, sort_keys=False, default_flow_style=False)
+    validate_secret_safety(updated_yaml)
+    return updated_yaml
 
 
 def safe_replace_container_image(
@@ -313,6 +411,7 @@ class GitOpsService:
             self.repo_root = Path(repo_root).resolve()
 
         self.trusted_targets = dict(trusted_targets or DEFAULT_TRUSTED_TARGETS)
+        self.scenario_manifests = dict(SCENARIO_MANIFEST_PATHS)
         self._lock = asyncio.Lock()
         self._change_records: Dict[str, GitOpsChangeRecord] = {}
 
@@ -367,7 +466,12 @@ class GitOpsService:
                 )
 
         target_key = (proposal.target_kind, proposal.target_name, proposal.target_namespace)
-        if target_key not in self.trusted_targets:
+        is_scenario_manifest = (
+            target_key in self.scenario_manifests
+            and proposal.patch is not None
+            and bool(proposal.patch.patch_content)
+        )
+        if target_key not in self.trusted_targets and not is_scenario_manifest:
             errors.append(
                 f"Target {proposal.target_kind}/{proposal.target_name} in namespace '{proposal.target_namespace}' "
                 f"is not a configured trusted GitOps remediation target."
@@ -409,24 +513,30 @@ class GitOpsService:
 
         target_key = (proposal.target_kind, proposal.target_name, proposal.target_namespace)
         target_config = self.trusted_targets.get(target_key)
+        scenario_rel_path = self.scenario_manifests.get(target_key)
 
-        if not target_config:
+        if not target_config and not scenario_rel_path:
             raise GitOpsValidationError(
                 f"Target {proposal.target_kind}/{proposal.target_name} in namespace '{proposal.target_namespace}' "
                 f"is not a configured trusted GitOps target."
             )
 
-        # Resolve replacement image
-        req_image = request.target_image if request else None
-        if req_image and req_image != target_config.trusted_replacement_image:
-            raise GitOpsValidationError(
-                f"Requested image '{req_image}' does not match trusted replacement image "
-                f"'{target_config.trusted_replacement_image}'."
-            )
-        replacement_image = target_config.trusted_replacement_image
-
-        custom_path = request.manifest_path if request else None
-        manifest_file = self._resolve_manifest_path(target_config, custom_path)
+        if target_config:
+            # Resolve replacement image
+            req_image = request.target_image if request else None
+            if req_image and req_image != target_config.trusted_replacement_image:
+                raise GitOpsValidationError(
+                    f"Requested image '{req_image}' does not match trusted replacement image "
+                    f"'{target_config.trusted_replacement_image}'."
+                )
+            replacement_image = target_config.trusted_replacement_image
+            custom_path = request.manifest_path if request else None
+            manifest_file = self._resolve_manifest_path(target_config, custom_path)
+        else:
+            if not proposal.patch or not proposal.patch.patch_content:
+                raise GitOpsValidationError("Proposal lacks structured patch_content for manifest patching.")
+            manifest_file = (self.repo_root / (request.manifest_path if request and request.manifest_path else scenario_rel_path)).resolve()
+            replacement_image = "N/A (YAML patch)"
 
         if not manifest_file.exists():
             raise GitOpsValidationError(f"Manifest file not found on disk: {manifest_file}")
@@ -436,16 +546,32 @@ class GitOpsService:
         except Exception as read_err:
             raise GitOpsError(f"Failed to read manifest file '{manifest_file}': {read_err}") from read_err
 
-        # Perform safe container image update
-        updated_content = safe_replace_container_image(
-            original_yaml_content=original_content,
-            target_kind=target_config.target_kind,
-            target_name=target_config.target_name,
-            container_name=target_config.container_name,
-            expected_current_image=target_config.current_image,
-            new_image=replacement_image,
-            target_namespace=target_config.target_namespace,
-        )
+        if target_config:
+            # Perform safe container image update
+            updated_content = safe_replace_container_image(
+                original_yaml_content=original_content,
+                target_kind=target_config.target_kind,
+                target_name=target_config.target_name,
+                container_name=target_config.container_name,
+                expected_current_image=target_config.current_image,
+                new_image=replacement_image,
+                target_namespace=target_config.target_namespace,
+            )
+            res_label = f"{target_config.target_kind}/{target_config.target_name}"
+            res_ns = target_config.target_namespace
+            c_name = target_config.container_name
+            curr_img = target_config.current_image
+        else:
+            updated_content = safe_apply_yaml_patch(
+                original_yaml_content=original_content,
+                target_kind=proposal.target_kind,
+                target_name=proposal.target_name,
+                patch_content=proposal.patch.patch_content,  # type: ignore[union-attr]
+            )
+            res_label = f"{proposal.target_kind}/{proposal.target_name}"
+            res_ns = proposal.target_namespace
+            c_name = "app"
+            curr_img = "N/A (YAML patch)"
 
         # Relative path for display in diff
         try:
@@ -463,11 +589,11 @@ class GitOpsService:
 
         return GitOpsPreviewResponse(
             proposal_id=proposal.proposal_id,
-            target_resource=f"{target_config.target_kind}/{target_config.target_name}",
-            target_namespace=target_config.target_namespace,
+            target_resource=res_label,
+            target_namespace=res_ns,
             target_file=rel_display_path,
-            container_name=target_config.container_name,
-            current_image=target_config.current_image,
+            container_name=c_name,
+            current_image=curr_img,
             replacement_image=replacement_image,
             diff=diff,
             is_approved=is_approved,
@@ -525,18 +651,33 @@ class GitOpsService:
         # 2. Resolve target configuration
         target_key = (proposal.target_kind, proposal.target_name, proposal.target_namespace)
         target_config = self.trusted_targets.get(target_key)
-        if not target_config:
+        scenario_rel_path = self.scenario_manifests.get(target_key)
+        if not target_config and not scenario_rel_path:
             raise GitOpsValidationError(
                 f"Target {proposal.target_kind}/{proposal.target_name} is not a trusted GitOps target."
             )
 
-        replacement_image = target_config.trusted_replacement_image
-        if request.target_image and request.target_image != replacement_image:
-            raise GitOpsValidationError(
-                f"Requested image '{request.target_image}' does not match trusted replacement '{replacement_image}'."
-            )
+        if target_config:
+            replacement_image = target_config.trusted_replacement_image
+            if request.target_image and request.target_image != replacement_image:
+                raise GitOpsValidationError(
+                    f"Requested image '{request.target_image}' does not match trusted replacement '{replacement_image}'."
+                )
+            manifest_file = self._resolve_manifest_path(target_config, request.manifest_path)
+            c_name = target_config.container_name
+            curr_img = target_config.current_image
+            res_ns = target_config.target_namespace
+            res_label = f"{target_config.target_kind}/{target_config.target_name}"
+        else:
+            if not proposal.patch or not proposal.patch.patch_content:
+                raise GitOpsValidationError("Proposal lacks structured patch_content for manifest patching.")
+            manifest_file = (self.repo_root / (request.manifest_path or scenario_rel_path)).resolve()
+            c_name = "app"
+            curr_img = "N/A (YAML patch)"
+            replacement_image = "N/A (YAML patch)"
+            res_ns = proposal.target_namespace
+            res_label = f"{proposal.target_kind}/{proposal.target_name}"
 
-        manifest_file = self._resolve_manifest_path(target_config, request.manifest_path)
         if not manifest_file.exists():
             raise GitOpsValidationError(f"Manifest file not found: {manifest_file}")
 
@@ -570,15 +711,23 @@ class GitOpsService:
 
         # 5. Read and transform manifest YAML
         original_content = manifest_file.read_text(encoding="utf-8")
-        updated_content = safe_replace_container_image(
-            original_yaml_content=original_content,
-            target_kind=target_config.target_kind,
-            target_name=target_config.target_name,
-            container_name=target_config.container_name,
-            expected_current_image=target_config.current_image,
-            new_image=replacement_image,
-            target_namespace=target_config.target_namespace,
-        )
+        if target_config:
+            updated_content = safe_replace_container_image(
+                original_yaml_content=original_content,
+                target_kind=target_config.target_kind,
+                target_name=target_config.target_name,
+                container_name=target_config.container_name,
+                expected_current_image=target_config.current_image,
+                new_image=replacement_image,
+                target_namespace=target_config.target_namespace,
+            )
+        else:
+            updated_content = safe_apply_yaml_patch(
+                original_yaml_content=original_content,
+                target_kind=proposal.target_kind,
+                target_name=proposal.target_name,
+                patch_content=proposal.patch.patch_content,  # type: ignore[union-attr]
+            )
 
         diff = generate_unified_diff(original_content, updated_content, rel_manifest_path)
 
@@ -619,10 +768,10 @@ class GitOpsService:
         # 8. Perform Local Git Operations with Atomic Rollback
         commit_hash = None
         commit_message = (
-            f"gitops: remediate {proposal.target_kind}/{proposal.target_name} ({target_config.container_name})\n\n"
+            f"gitops: remediate {proposal.target_kind}/{proposal.target_name} ({c_name})\n\n"
             f"Proposal ID: {proposal.proposal_id}\n"
             f"Approved by: {proposal.approval.reviewer if proposal.approval else request.operator}\n"
-            f"Image update: {target_config.current_image} -> {replacement_image}\n"
+            f"Change: {curr_img} -> {replacement_image}\n"
             f"Justification: {proposal.justification}\n"
         )
 
@@ -711,11 +860,11 @@ class GitOpsService:
         # 8. Construct Persistent Change Record
         record = GitOpsChangeRecord(
             proposal_id=proposal.proposal_id,
-            target_resource=f"{target_config.target_kind}/{target_config.target_name}",
-            target_namespace=target_config.target_namespace,
+            target_resource=res_label,
+            target_namespace=res_ns,
             target_file=rel_manifest_path,
-            container_name=target_config.container_name,
-            current_image=target_config.current_image,
+            container_name=c_name,
+            current_image=curr_img,
             replacement_image=replacement_image,
             diff=diff,
             branch_name=branch_name,
@@ -750,6 +899,140 @@ class GitOpsService:
             records = [r for r in records if r.status.value == status or r.status == status]
 
         return records
+
+    @staticmethod
+    def _resolve_github_repo() -> str:
+        """Resolve 'owner/repo' from GITHUB_REPO or GITHUB_REPO_URL environment variables."""
+        repo = os.environ.get("GITHUB_REPO", "").strip().strip("/")
+        if repo:
+            return repo
+        repo_url = os.environ.get("GITHUB_REPO_URL", "").strip()
+        if repo_url:
+            cleaned = repo_url.rstrip("/")
+            if cleaned.endswith(".git"):
+                cleaned = cleaned[:-4]
+            if "github.com/" in cleaned:
+                return cleaned.split("github.com/", 1)[1].strip("/")
+            if "github.com:" in cleaned:
+                return cleaned.split("github.com:", 1)[1].strip("/")
+        return ""
+
+    async def create_github_pr(
+        self,
+        change_id: str,
+        base_branch: Optional[str] = None,
+    ) -> GitOpsChangeRecord:
+        """
+        Push a prepared local GitOps feature branch and open a GitHub Pull Request.
+
+        SAFETY GUARANTEES:
+        - Only operates on an already-prepared branch (BRANCH_PREPARED), which requires prior human approval.
+        - Never pushes directly to main/master; only pushes the feature branch.
+        - Never exposes GITHUB_TOKEN in errors, logs, or responses.
+        """
+        async with self._lock:
+            record = self._change_records.get(change_id)
+
+        if not record:
+            raise GitOpsValidationError(f"GitOps change record '{change_id}' not found.")
+
+        if record.pr_url:
+            return record
+
+        if record.status != GitOpsStatus.BRANCH_PREPARED or not record.branch_name:
+            raise GitOpsValidationError(
+                f"GitOps change '{change_id}' must be in BRANCH_PREPARED status before creating a PR "
+                f"(current status: '{record.status.value}')."
+            )
+
+        if record.branch_name in ("main", "master"):
+            raise GitOpsValidationError("Refusing to push protected base branch directly.")
+
+        token = os.environ.get("GITHUB_TOKEN", "").strip()
+        repo = self._resolve_github_repo()
+        target_base = (base_branch or os.environ.get("GITHUB_BASE_BRANCH", "main")).strip() or "main"
+
+        if not token:
+            raise GitOpsValidationError(
+                "GITHUB_TOKEN is not configured in backend .env. Add GITHUB_TOKEN to create GitHub PRs."
+            )
+        if not repo or "/" not in repo:
+            raise GitOpsValidationError(
+                "GITHUB_REPO (format: 'owner/repo') is not configured in backend .env."
+            )
+
+        # 1. Push only the prepared feature branch using authenticated HTTPS URL
+        push_url = f"https://x-access-token:{token}@github.com/{repo}.git"
+        proc = subprocess.run(
+            ["git", "push", "-u", push_url, record.branch_name],
+            cwd=str(self.repo_root),
+            capture_output=True,
+            text=True,
+        )
+        if proc.returncode != 0:
+            from app.orchestrator.sanitizer import sanitize_error_message
+
+            safe_err = sanitize_error_message(proc.stderr.replace(token, "[REDACTED_TOKEN]"))
+            raise GitOpsError(f"Failed to push branch '{record.branch_name}' to GitHub: {safe_err}")
+
+        # 2. Create Pull Request via GitHub REST API
+        pr_title = f"fix(gitops): remediate {record.target_resource} ({record.container_name})"
+        pr_body = (
+            f"## KafaKube8 Automated GitOps Remediation\n\n"
+            f"- **Target Resource:** `{record.target_resource}` (namespace: `{record.target_namespace}`)\n"
+            f"- **Container:** `{record.container_name}`\n"
+            f"- **Image Change:** `{record.current_image}` → `{record.replacement_image}`\n"
+            f"- **Manifest File:** `{record.target_file}`\n"
+            f"- **Approved By:** `{record.operator}`\n"
+            f"- **Proposal ID:** `{record.proposal_id}`\n\n"
+            f"### Diff\n```diff\n{record.diff}\n```\n\n"
+            f"---\n*Opened after mandatory human operator approval via KafaKube8.*"
+        )
+
+        api_url = f"https://api.github.com/repos/{repo}/pulls"
+        headers = {
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/vnd.github+json",
+            "X-GitHub-Api-Version": "2022-11-28",
+        }
+        payload = {
+            "title": pr_title,
+            "head": record.branch_name,
+            "base": target_base,
+            "body": pr_body,
+        }
+
+        async with httpx.AsyncClient(timeout=20.0) as client:
+            resp = await client.post(api_url, headers=headers, json=payload)
+
+        if resp.status_code not in (200, 201):
+            from app.orchestrator.sanitizer import sanitize_error_message
+
+            safe_body = sanitize_error_message(resp.text.replace(token, "[REDACTED_TOKEN]"))
+            raise GitOpsError(f"GitHub API returned HTTP {resp.status_code}: {safe_body}")
+
+        pr_data = resp.json()
+        pr_url = pr_data.get("html_url")
+        pr_number = pr_data.get("number")
+
+        async with self._lock:
+            record.pr_url = pr_url
+            record.pr_number = pr_number
+            record.status = GitOpsStatus.PR_OPENED
+            record.audit_events.append(
+                GitOpsAuditEvent(
+                    event_type="PR_OPENED",
+                    operator=record.operator,
+                    details={
+                        "repo": repo,
+                        "base_branch": target_base,
+                        "head_branch": record.branch_name,
+                        "pr_url": pr_url,
+                        "pr_number": pr_number,
+                    },
+                )
+            )
+        return record
 
 
 # Global Singleton Service Instance

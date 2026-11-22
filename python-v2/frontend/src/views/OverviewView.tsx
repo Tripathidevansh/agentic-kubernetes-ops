@@ -5,6 +5,7 @@ interface OverviewViewProps {
   overview: ClusterOverviewResponse | null;
   incidents: IncidentItem[];
   geminiModel: string;
+  operatorName?: string;
   onInvestigatePod: (podName: string) => void;
   onViewAllIncidents: () => void;
   onOpenNewInvestigation: () => void;
@@ -14,6 +15,7 @@ export const OverviewView: React.FC<OverviewViewProps> = ({
   overview,
   incidents,
   geminiModel,
+  operatorName = 'Operator',
   onInvestigatePod,
   onViewAllIncidents,
   onOpenNewInvestigation,
@@ -22,7 +24,9 @@ export const OverviewView: React.FC<OverviewViewProps> = ({
   const runningPods = overview?.running_pods ?? 0;
   const pendingPods = overview?.pending_pods ?? 0;
   const failedPods = overview?.failed_pods ?? 0;
-  const totalRestarts = overview?.total_restarts ?? 0;
+  const totalRestarts =
+    overview?.total_restarts ??
+    (overview?.pods?.reduce((sum, p) => sum + (p.restarts || 0), 0) || 0);
   const activeIncidentCount = incidents.length;
 
   const runningPct = totalPods > 0 ? ((runningPods / totalPods) * 100).toFixed(1) : '100';
@@ -65,7 +69,7 @@ export const OverviewView: React.FC<OverviewViewProps> = ({
             </span>
           </div>
           <h1 className="font-headline-xl text-headline-xl text-on-surface font-semibold">
-            Good morning, Operator
+            Good morning, {operatorName}
           </h1>
           <p className="font-body-md text-body-md text-on-surface-variant max-w-3xl">
             Here's what's happening across your Kubernetes environment. Agentic diagnosis active on cluster{' '}
