@@ -14,17 +14,14 @@ spec:
         app: oom-test
     spec:
       containers:
-        - name: app
-          image: python:3.12-alpine
-          command:
-            - python
-            - -c
-            - |
-              data = []
-              while True:
-                  data.append("x" * 1024 * 1024)
-          resources:
-            limits:
-              memory: "32Mi"
-            requests:
-              memory: "16Mi"
+      - name: app
+        image: python:3.12-alpine
+        command:
+        - python
+        - -c
+        - "data = []\nwhile True:\n    data.append(\"x\" * 1024 * 1024)\n"
+        resources:
+          limits:
+            memory: 256Mi
+          requests:
+            memory: 128Mi
